@@ -29,8 +29,8 @@ namespace Moljave.Http
             if (headerEnd == -1)
                 throw new Exception("Failed to find header/body separator");
 
-            string headerText = Encoding.ASCII.GetString(responseBytes, 0, headerEnd);
-            using (var sr = new StringReader(headerText))
+            string headerText = System.Text.Encoding.ASCII.GetString(responseBytes, 0, headerEnd);
+            using (var sr = new System.IO.StringReader(headerText))
             {
                 var statusLine = sr.ReadLine();
                 if (statusLine != null)
@@ -61,46 +61,53 @@ namespace Moljave.Http
 
             byte[] bodyBytes = responseBytes.Skip(headerEnd).ToArray();
 
-            string bodyString;
-            if (!string.IsNullOrEmpty(contentEncoding) && bodyBytes.Length > 0)
+            string bodyString = string.Empty;
+
+            if (bodyBytes.Length > 0 && !string.IsNullOrEmpty(contentEncoding))
             {
                 try
                 {
                     if (contentEncoding.Contains("gzip"))
                     {
-                        using (var ms = new MemoryStream(bodyBytes))
-                        using (var gzip = new GZipStream(ms, CompressionMode.Decompress))
-                        using (var reader = new StreamReader(gzip))
+                        using (var ms = new System.IO.MemoryStream(bodyBytes))
+                        using (var gzip = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionMode.Decompress))
+                        using (var reader = new System.IO.StreamReader(gzip))
                             bodyString = reader.ReadToEnd();
                     }
                     else if (contentEncoding.Contains("deflate"))
                     {
-                        using (var ms = new MemoryStream(bodyBytes))
-                        using (var deflate = new DeflateStream(ms, CompressionMode.Decompress))
-                        using (var reader = new StreamReader(deflate))
+                        using (var ms = new System.IO.MemoryStream(bodyBytes))
+                        using (var deflate = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionMode.Decompress))
+                        using (var reader = new System.IO.StreamReader(deflate))
                             bodyString = reader.ReadToEnd();
                     }
                     else if (contentEncoding.Contains("br"))
                     {
-                        using (var ms = new MemoryStream(bodyBytes))
-                        using (var br = new BrotliStream(ms, CompressionMode.Decompress))
-                        using (var reader = new StreamReader(br))
+                        using (var ms = new System.IO.MemoryStream(bodyBytes))
+                        using (var br = new System.IO.Compression.BrotliStream(ms, System.IO.Compression.CompressionMode.Decompress))
+                        using (var reader = new System.IO.StreamReader(br))
                             bodyString = reader.ReadToEnd();
                     }
                     else
                     {
-                        bodyString = Encoding.UTF8.GetString(bodyBytes);
+                        bodyString = System.Text.Encoding.UTF8.GetString(bodyBytes);
                     }
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine("Failed to decompress response: " + ex.Message);
-                    bodyString = Encoding.UTF8.GetString(bodyBytes);
+                    bodyString = System.Text.Encoding.UTF8.GetString(bodyBytes);
                 }
+            }
+            else if (bodyBytes.Length > 0)
+            {
+                // no encoding, just text or binary
+                bodyString = System.Text.Encoding.UTF8.GetString(bodyBytes);
             }
             else
             {
-                bodyString = Encoding.UTF8.GetString(bodyBytes);
+                // No body at all
+                bodyString = string.Empty;
             }
 
             httpResponse.Content = new StringContent(bodyString);

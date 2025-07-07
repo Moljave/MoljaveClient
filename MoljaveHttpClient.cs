@@ -28,7 +28,13 @@ namespace Moljave.Http
         public void Dispose() => _tlsClient?.Dispose();
 
         public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, TimeSpan timeout)
-            => await SendAsyncInternal(request, timeout, 0);
+        {
+            // Буферизация тела запроса (важно для POST/PUT/PATCH/DELETE)
+            if (request.Content != null)
+                request.Content = await request.Content.BufferAsync();
+
+            return await SendAsyncInternal(request, timeout, 0);
+        }
 
         private async Task<HttpResponseMessage> SendAsyncInternal(HttpRequestMessage request, TimeSpan timeout, int redirectCount)
         {
@@ -78,7 +84,8 @@ namespace Moljave.Http
                         ? response.Headers.Location
                         : new Uri(uri, response.Headers.Location);
 
-                    var newRequest = HttpRequestStringifier.CloneWithRedirect(request, newUri, response.StatusCode);
+                    // Клонируем и буферизуем новый запрос для редиректа
+                    var newRequest = await HttpRequestStringifier.CloneWithRedirectAsync(request, newUri, response.StatusCode);
                     response.Dispose();
                     return await SendAsyncInternal(newRequest, timeout, redirectCount + 1);
                 }

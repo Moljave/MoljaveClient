@@ -9,8 +9,7 @@ namespace Moljave.Http
     {
         public static async Task<string> Stringify(HttpRequestMessage request)
         {
-            var sb = new StringBuilder();
-
+            var sb = new System.Text.StringBuilder();
             sb.AppendLine($"{request.Method} {request.RequestUri.PathAndQuery} HTTP/1.1");
             sb.AppendLine($"Host: {request.RequestUri.Host}");
 
@@ -34,7 +33,10 @@ namespace Moljave.Http
             return sb.ToString();
         }
 
-        public static HttpRequestMessage CloneWithRedirect(HttpRequestMessage oldRequest, Uri newUri, HttpStatusCode redirectStatus)
+        public static async Task<HttpRequestMessage> CloneWithRedirectAsync(
+            HttpRequestMessage oldRequest,
+            Uri newUri,
+            HttpStatusCode redirectStatus)
         {
             var newMethod = oldRequest.Method;
             if (redirectStatus == HttpStatusCode.SeeOther ||
@@ -47,13 +49,16 @@ namespace Moljave.Http
 
             foreach (var header in oldRequest.Headers)
             {
-                if (header.Key.Equals("Host", System.StringComparison.OrdinalIgnoreCase)) continue;
+                if (header.Key.Equals("Host", StringComparison.OrdinalIgnoreCase)) continue;
                 try { newRequest.Headers.TryAddWithoutValidation(header.Key, header.Value); }
                 catch { }
             }
 
             if (newMethod == HttpMethod.Post || newMethod == HttpMethod.Put || newMethod == HttpMethod.Patch)
-                newRequest.Content = oldRequest.Content;
+            {
+                if (oldRequest.Content != null)
+                    newRequest.Content = await oldRequest.Content.BufferAsync();
+            }
 
             return newRequest;
         }
