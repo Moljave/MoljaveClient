@@ -11,10 +11,10 @@
 
 ## 🚀 Features
 
-- **Custom TLS (JA3) Fingerprinting** — simulate Chrome or your own fingerprint, or rotate per request
+- **Custom TLS (JA3) Fingerprinting** — automatically generated per-client, rotate with a single call, or supply your own profile
 - **SOCKS4/SOCKS4a/SOCKS5 & HTTP/HTTPS Proxy support** — including authentication and remote DNS
 - **Automatic redirects** — configurable at runtime or per request
-- **CookieContainer support** — browser-like cookie handling with thread-safety in mind
+- **Advanced cookie management** — tweak, clear or replace cookies at runtime with thread-safety in mind
 - **DelegatingHandler pipeline** — plug in your own handlers like with regular `HttpClient`
 - **Per-request overrides** — change proxy/TLS/fingerprint/timeout for individual calls
 - **Custom headers** — send and control order like a browser
@@ -46,18 +46,14 @@ class Program
 {
     static async Task Main()
     {
-        // Select browser JA3 fingerprint profile
-        var ja3 = JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome);
-
-        // Optional: Use CookieContainer and/or Proxy
-        var cookies = new CookieContainer();
-        var proxy = new WebProxy("socks5://127.0.0.1:9050"); // Or use HTTP proxy
-
-        using var client = new MojaveHttpClient(ja3, cookies, proxy)
+        using var client = new MojaveHttpClient()
         {
             AllowAutoRedirect = true,
             DefaultTimeout = TimeSpan.FromSeconds(20)
         };
+
+        // Optionally plug in a proxy at runtime
+        client.UseProxy(new WebProxy("socks5://127.0.0.1:9050"));
 
         var request = new HttpRequestMessage(HttpMethod.Get, "https://example.com/");
         request.AddHeaders(@"
@@ -80,8 +76,6 @@ class Program
 ```csharp
 var options = new MojaveHttpClientOptions
 {
-    FingerprintProvider = () => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome),
-    CookieContainer = new CookieContainer(),
     DefaultTimeout = TimeSpan.FromSeconds(25),
     ProxyResolver = () => ProxyParser.TryParse(GetNextProxy(), out var proxy)
         ? proxy
@@ -92,6 +86,12 @@ var options = new MojaveHttpClientOptions
 options.DelegatingHandlerFactories.Add(() => new MyTelemetryHandler());
 
 using var client = new MojaveHttpClient(options);
+
+// rotate to a fresh JA3 fingerprint whenever you need
+client.RotateFingerprint();
+
+// set or mutate cookies at runtime
+client.CookieManager.SetCookie("example.com", "session", "12345");
 
 var request = new HttpRequestMessage(HttpMethod.Get, "https://api.example.com/data");
 request.ConfigureMojaveOptions(o =>
@@ -108,6 +108,35 @@ request.ConfigureMojaveOptions(o =>
 });
 
 var response = await client.SendAsync(request);
+```
+
+### 🍪 Cookie management cheatsheet
+
+```csharp
+// Update a cookie value on the fly
+client.CookieManager.SetCookie("example.com", "session", "new-value");
+
+// Remove a specific cookie
+client.CookieManager.RemoveCookie("example.com", "session");
+
+// Clear cookies for a single domain or every domain
+client.ClearCookiesForDomain("example.com");
+client.ClearAllCookies();
+```
+
+### 🧭 Hot proxy switching
+
+```csharp
+// Use a direct proxy instance
+client.UseProxy(new WebProxy("http://127.0.0.1:8888"));
+
+// Swap proxies on the fly
+client.UseProxyResolver(() => ProxyParser.TryParse(GetNextProxy(), out var proxy)
+    ? proxy
+    : MojaveProxyOptions.NoProxy);
+
+// Reset back to no proxy
+client.ClearProxy();
 ```
 ## 🧪 Custom JA3 Example
 

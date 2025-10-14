@@ -19,7 +19,19 @@ namespace Moljave.Http
         public Func<MojaveProxyOptions> ProxyResolver { get; set; }
             = () => MojaveProxyOptions.NoProxy;
 
-        public CookieContainer CookieContainer { get; set; } = new();
+        private MojaveCookieManager _cookieManager = new();
+
+        public MojaveCookieManager CookieManager
+        {
+            get => _cookieManager;
+            set => _cookieManager = value ?? new MojaveCookieManager();
+        }
+
+        public CookieContainer CookieContainer
+        {
+            get => _cookieManager?.GetInternalContainer();
+            set => (_cookieManager ??= new MojaveCookieManager()).ReplaceWith(value ?? new CookieContainer());
+        }
 
         public bool AllowAutoRedirect { get; set; } = true;
 
@@ -78,7 +90,7 @@ namespace Moljave.Http
         public TimeSpan? Timeout { get; set; }
         public bool? AllowAutoRedirect { get; set; }
         public int? MaxAutomaticRedirections { get; set; }
-        public CookieContainer CookieContainer { get; set; }
+        public MojaveCookieManager CookieManager { get; set; }
 
         internal MojaveRequestOptions Clone() => new()
         {
@@ -88,7 +100,7 @@ namespace Moljave.Http
             Timeout = Timeout,
             AllowAutoRedirect = AllowAutoRedirect,
             MaxAutomaticRedirections = MaxAutomaticRedirections,
-            CookieContainer = CookieContainer
+            CookieManager = CookieManager
         };
     }
 

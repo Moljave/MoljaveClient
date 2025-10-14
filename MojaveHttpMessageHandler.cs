@@ -9,8 +9,6 @@ namespace Moljave.Http
     internal sealed class MojaveHttpMessageHandler : HttpMessageHandler
     {
         private readonly MojaveHttpClientOptions _options;
-        private readonly object _cookieLock = new();
-
         public MojaveHttpMessageHandler(MojaveHttpClientOptions options)
         {
             _options = options ?? throw new ArgumentNullException(nameof(options));
@@ -36,7 +34,7 @@ namespace Moljave.Http
             var effectiveTimeout = requestOptions.Timeout ?? _options.DefaultTimeout;
             var allowRedirect = requestOptions.AllowAutoRedirect ?? _options.AllowAutoRedirect;
             var maxRedirects = requestOptions.MaxAutomaticRedirections ?? _options.MaxAutomaticRedirections;
-            var cookieContainer = requestOptions.CookieContainer ?? _options.CookieContainer;
+            var cookieManager = requestOptions.CookieManager ?? _options.CookieManager;
             var fingerprint = requestOptions.Fingerprint ?? _options.FingerprintProvider?.Invoke() ?? JA3Fingerprint.Default;
             var tlsSettings = requestOptions.TlsSettings ?? _options.TlsSettingsProvider?.Invoke() ?? MojaveTlsSettings.Default;
             var proxyOptions = requestOptions.Proxy ?? _options.ProxyResolver?.Invoke() ?? MojaveProxyOptions.NoProxy;
@@ -51,13 +49,9 @@ namespace Moljave.Http
                 request.Headers.TryAddWithoutValidation("Accept-Encoding", "gzip, deflate, br");
             }
 
-            if (cookieContainer != null)
+            if (cookieManager != null)
             {
-                string cookieHeader;
-                lock (_cookieLock)
-                {
-                    cookieHeader = cookieContainer.GetCookieHeader(uri);
-                }
+                var cookieHeader = cookieManager.GetCookieHeader(uri);
 
                 if (!string.IsNullOrEmpty(cookieHeader))
                 {
@@ -86,15 +80,9 @@ namespace Moljave.Http
 
             var response = HttpResponseParser.Parse(responseBytes);
 
-            if (cookieContainer != null && response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
+            if (cookieManager != null && response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
             {
-                lock (_cookieLock)
-                {
-                    foreach (var cookie in setCookieHeaders)
-                    {
-                        cookieContainer.SetCookies(uri, cookie);
-                    }
-                }
+                cookieManager.UpdateFromSetCookieHeaders(uri, setCookieHeaders);
             }
 
             if (allowRedirect && IsRedirect(response.StatusCode))
