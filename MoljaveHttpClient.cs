@@ -1,104 +1,97 @@
-﻿using Moljave.Http;
+using System;
 using System.Net;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Moljave.Http
 {
-    public class MojaveHttpClient : IDisposable
+    public sealed class MojaveHttpClient : IDisposable
     {
-        private TlsClient _tlsClient;
-        private JA3Fingerprint _ja3Fingerprint;
-        private readonly CookieContainer _cookieContainer;
-        private readonly WebProxy _proxy;
-        public bool AllowAutoRedirect { get; set; } = true;
-        public int MaxAutomaticRedirections { get; set; } = 10;
-
-        private string _lastHost = null;
-        private int _lastPort = -1;
+        private readonly MojaveHttpClientOptions _options;
+        private readonly HttpMessageInvoker _invoker;
+        private bool _disposed;
 
         public MojaveHttpClient(
             JA3Fingerprint ja3Fingerprint = null,
             CookieContainer cookieContainer = null,
             WebProxy proxy = null)
+            : this(new MojaveHttpClientOptions
+            {
+                FingerprintProvider = () => ja3Fingerprint ?? JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome),
+                CookieContainer = cookieContainer ?? new CookieContainer(),
+                ProxyResolver = proxy != null
+                    ? () => MojaveProxyOptions.FromWebProxy(proxy)
+                    : () => MojaveProxyOptions.NoProxy
+            })
         {
-            _cookieContainer = cookieContainer ?? new CookieContainer();
-            _proxy = proxy;
-            _ja3Fingerprint = ja3Fingerprint ?? JA3Fingerprint.Default;
         }
 
-        public void Dispose() => _tlsClient?.Dispose();
-
-        public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, TimeSpan timeout)
+        public MojaveHttpClient(MojaveHttpClientOptions options)
         {
-            // Буферизация тела запроса (важно для POST/PUT/PATCH/DELETE)
-            if (request.Content != null)
-                request.Content = await request.Content.BufferAsync();
-
-            return await SendAsyncInternal(request, timeout, 0);
+            _options = options ?? throw new ArgumentNullException(nameof(options));
+            _invoker = new HttpMessageInvoker(_options.BuildHandlerPipeline(), disposeHandler: true);
         }
 
-        private async Task<HttpResponseMessage> SendAsyncInternal(HttpRequestMessage request, TimeSpan timeout, int redirectCount)
+        public bool AllowAutoRedirect
         {
+            get => _options.AllowAutoRedirect;
+            set => _options.AllowAutoRedirect = value;
+        }
+
+        public int MaxAutomaticRedirections
+        {
+            get => _options.MaxAutomaticRedirections;
+            set => _options.MaxAutomaticRedirections = value;
+        }
+
+        public TimeSpan DefaultTimeout
+        {
+            get => _options.DefaultTimeout;
+            set => _options.DefaultTimeout = value;
+        }
+
+        public CookieContainer CookieContainer
+        {
+            get => _options.CookieContainer;
+            set => _options.CookieContainer = value ?? new CookieContainer();
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            _invoker.Dispose();
+        }
+
+        public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
+            => SendAsync(request, _options.DefaultTimeout, cancellationToken);
+
+        public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, TimeSpan timeout, CancellationToken cancellationToken = default)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(MojaveHttpClient));
+            }
+
             if (request == null)
+            {
                 throw new ArgumentNullException(nameof(request));
-
-            var uri = request.RequestUri ?? throw new ArgumentNullException("RequestUri");
-            var host = uri.Host;
-            var port = uri.Port > 0 ? uri.Port : 443;
-
-            if (_tlsClient == null || !(_lastHost?.Equals(host, StringComparison.OrdinalIgnoreCase) ?? false) || _lastPort != port)
-            {
-                _tlsClient?.Dispose();
-                _tlsClient = new TlsClient(host, port, _ja3Fingerprint, _proxy);
-                _lastHost = host;
-                _lastPort = port;
             }
 
-            if (!request.Headers.Contains("Accept-Encoding"))
-                request.Headers.Add("Accept-Encoding", "gzip, deflate, br");
-
-            string cookieHeader = _cookieContainer.GetCookieHeader(uri);
-            if (!string.IsNullOrEmpty(cookieHeader))
+            request.ConfigureMojaveOptions(options =>
             {
-                request.Headers.Remove("Cookie");
-                request.Headers.Add("Cookie", cookieHeader);
-            }
-
-            var requestString = await HttpRequestStringifier.Stringify(request);
-            var responseBytes = await _tlsClient.SendRequestAsync(requestString, timeout);
-            var response = HttpResponseParser.Parse(responseBytes);
-
-            if (response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
-            {
-                foreach (var setCookieHeader in setCookieHeaders)
-                    _cookieContainer.SetCookies(uri, setCookieHeader);
-            }
-
-            if (AllowAutoRedirect && IsRedirect(response.StatusCode))
-            {
-                if (redirectCount >= MaxAutomaticRedirections)
-                    throw new Exception("Maximum redirection count exceeded.");
-
-                if (response.Headers.Location != null)
+                if (!options.Timeout.HasValue)
                 {
-                    var newUri = response.Headers.Location.IsAbsoluteUri
-                        ? response.Headers.Location
-                        : new Uri(uri, response.Headers.Location);
-
-                    // Клонируем и буферизуем новый запрос для редиректа
-                    var newRequest = await HttpRequestStringifier.CloneWithRedirectAsync(request, newUri, response.StatusCode);
-                    response.Dispose();
-                    return await SendAsyncInternal(newRequest, timeout, redirectCount + 1);
+                    options.Timeout = timeout;
                 }
-            }
+            });
 
-            return response;
+            return _invoker.SendAsync(request, cancellationToken);
         }
-
-        private bool IsRedirect(HttpStatusCode code) =>
-            code == HttpStatusCode.MovedPermanently ||
-            code == HttpStatusCode.Redirect ||
-            code == HttpStatusCode.RedirectMethod ||
-            code == HttpStatusCode.TemporaryRedirect ||
-            (int)code == 308;
     }
 }

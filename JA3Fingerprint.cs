@@ -34,6 +34,7 @@ namespace Moljave.Http
         {
             return SslVersion switch
             {
+                772 => SslProtocols.Tls13,
                 769 => SslProtocols.Tls12,
                 768 => SslProtocols.Tls11,
                 767 => SslProtocols.Tls,

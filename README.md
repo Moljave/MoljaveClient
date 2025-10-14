@@ -11,10 +11,12 @@
 
 ## 🚀 Features
 
-- **Custom TLS (JA3) Fingerprinting** — simulate Chrome or your own fingerprint
-- **SOCKS5 & HTTP Proxy support** — including authentication
-- **Automatic redirects** — configurable at runtime
-- **CookieContainer support** — browser-like cookie handling
+- **Custom TLS (JA3) Fingerprinting** — simulate Chrome or your own fingerprint, or rotate per request
+- **SOCKS4/SOCKS4a/SOCKS5 & HTTP/HTTPS Proxy support** — including authentication and remote DNS
+- **Automatic redirects** — configurable at runtime or per request
+- **CookieContainer support** — browser-like cookie handling with thread-safety in mind
+- **DelegatingHandler pipeline** — plug in your own handlers like with regular `HttpClient`
+- **Per-request overrides** — change proxy/TLS/fingerprint/timeout for individual calls
 - **Custom headers** — send and control order like a browser
 - **Auto-decompression** — supports gzip, deflate, br (brotli)
 - **Raw HTTP/1.1 request/response** — maximum control
@@ -53,7 +55,8 @@ class Program
 
         using var client = new MojaveHttpClient(ja3, cookies, proxy)
         {
-            AllowAutoRedirect = true // Can be toggled at runtime
+            AllowAutoRedirect = true,
+            DefaultTimeout = TimeSpan.FromSeconds(20)
         };
 
         var request = new HttpRequestMessage(HttpMethod.Get, "https://example.com/");
@@ -71,6 +74,40 @@ class Program
         Console.WriteLine(html);
     }
 }
+```
+### 🔧 Advanced configuration
+
+```csharp
+var options = new MojaveHttpClientOptions
+{
+    FingerprintProvider = () => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome),
+    CookieContainer = new CookieContainer(),
+    DefaultTimeout = TimeSpan.FromSeconds(25),
+    ProxyResolver = () => ProxyParser.TryParse(GetNextProxy(), out var proxy)
+        ? proxy
+        : MojaveProxyOptions.NoProxy
+};
+
+// add delegating handlers like with HttpClient
+options.DelegatingHandlerFactories.Add(() => new MyTelemetryHandler());
+
+using var client = new MojaveHttpClient(options);
+
+var request = new HttpRequestMessage(HttpMethod.Get, "https://api.example.com/data");
+request.ConfigureMojaveOptions(o =>
+{
+    o.Timeout = TimeSpan.FromSeconds(5);
+    o.Proxy = ProxyParser.TryParse("socks5://127.0.0.1:9050", out var proxy)
+        ? proxy
+        : MojaveProxyOptions.NoProxy;
+    o.TlsSettings = new MojaveTlsSettings
+    {
+        EnabledProtocols = System.Security.Authentication.SslProtocols.Tls13,
+        ApplicationProtocols = new[] { "h2", "http/1.1" }
+    };
+});
+
+var response = await client.SendAsync(request);
 ```
 ## 🧪 Custom JA3 Example
 
