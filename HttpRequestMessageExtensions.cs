@@ -85,7 +85,7 @@ namespace Moljave.Http
 
             if (options == null)
             {
-                request.Options.Remove(MojaveOptionsKey, out _);
+                request.Options.Remove(MojaveOptionsKey.Key, out _);
                 return;
             }
 

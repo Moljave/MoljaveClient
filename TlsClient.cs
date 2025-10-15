@@ -54,30 +54,7 @@ namespace Moljave.Http
                 throw new ArgumentNullException(nameof(requestBytes));
             }
 
-            _tcpClient = new TcpClient
-            {
-                NoDelay = true
-            };
-
-            if (_proxy == null)
-            {
-                await _tcpClient.ConnectAsync(_host, _port).WaitAsync(cancellationToken).ConfigureAwait(false);
-                _transportStream = _tcpClient.GetStream();
-            }
-            else
-            {
-                await ConnectThroughProxyAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            var activeStream = _transportStream;
-
-            if (useTls)
-            {
-                _sslStream = new SslStream(activeStream, leaveInnerStreamOpen: false, GetValidationCallback());
-                var authenticationOptions = BuildAuthenticationOptions();
-                await _sslStream.AuthenticateAsClientAsync(authenticationOptions, cancellationToken).ConfigureAwait(false);
-                activeStream = _sslStream;
-            }
+            var activeStream = await GetActiveStreamAsync(useTls, cancellationToken).ConfigureAwait(false);
 
             await activeStream.WriteAsync(requestBytes, 0, requestBytes.Length, cancellationToken).ConfigureAwait(false);
             await activeStream.FlushAsync(cancellationToken).ConfigureAwait(false);
@@ -140,6 +117,56 @@ namespace Moljave.Http
             }
 
             return memoryStream.ToArray();
+        }
+
+        public async Task<Stream> CreateTransportStreamAsync(CancellationToken cancellationToken)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(TlsClient));
+            }
+
+            if (_transportStream != null)
+            {
+                return _transportStream;
+            }
+
+            _tcpClient = new TcpClient
+            {
+                NoDelay = true
+            };
+
+            if (_proxy == null)
+            {
+                await _tcpClient.ConnectAsync(_host, _port).WaitAsync(cancellationToken).ConfigureAwait(false);
+                _transportStream = _tcpClient.GetStream();
+            }
+            else
+            {
+                await ConnectThroughProxyAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            return _transportStream;
+        }
+
+        private async Task<Stream> GetActiveStreamAsync(bool useTls, CancellationToken cancellationToken)
+        {
+            var transportStream = await CreateTransportStreamAsync(cancellationToken).ConfigureAwait(false);
+
+            if (!useTls)
+            {
+                return transportStream;
+            }
+
+            if (_sslStream != null)
+            {
+                return _sslStream;
+            }
+
+            _sslStream = new SslStream(transportStream, leaveInnerStreamOpen: false, GetValidationCallback());
+            var authenticationOptions = BuildAuthenticationOptions();
+            await _sslStream.AuthenticateAsClientAsync(authenticationOptions, cancellationToken).ConfigureAwait(false);
+            return _sslStream;
         }
 
         private async Task ConnectThroughProxyAsync(CancellationToken cancellationToken)

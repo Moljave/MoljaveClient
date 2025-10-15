@@ -1,6 +1,7 @@
 using System;
 using System.Net;
 using System.Net.Http;
+using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -105,7 +106,12 @@ namespace Moljave.Http
                 newMethod = HttpMethod.Get;
             }
 
-            var newRequest = new HttpRequestMessage(newMethod, newUri);
+            var newRequest = new HttpRequestMessage(newMethod, newUri)
+            {
+                Version = oldRequest.Version
+            };
+
+            CopyVersionPolicy(oldRequest, newRequest);
 
             foreach (var header in oldRequest.Headers)
             {
@@ -123,6 +129,18 @@ namespace Moljave.Http
             }
 
             return newRequest;
+        }
+
+        internal static void CopyVersionPolicy(HttpRequestMessage source, HttpRequestMessage destination)
+        {
+            var versionPolicyProperty = typeof(HttpRequestMessage).GetProperty("VersionPolicy");
+            if (versionPolicyProperty == null)
+            {
+                return;
+            }
+
+            var value = versionPolicyProperty.GetValue(source);
+            versionPolicyProperty.SetValue(destination, value);
         }
     }
 }

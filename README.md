@@ -19,7 +19,7 @@
 - **Per-request overrides** — change proxy/TLS/fingerprint/timeout for individual calls
 - **Custom headers** — send and control order like a browser
 - **Auto-decompression** — supports gzip, deflate, br (brotli)
-- **Raw HTTP/1.1 request/response** — maximum control
+- **Raw HTTP/1.1 & HTTP/2 request/response** — maximum control with on-the-fly protocol selection
 - **Async/await** — modern, fast, thread-safe
 - **Easy to extend** — add more fingerprints or features
 
