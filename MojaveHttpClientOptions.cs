@@ -13,6 +13,7 @@ namespace Moljave.Http
         private int _maxConnectionRetries = 2;
         private TimeSpan _connectionRetryDelay = TimeSpan.FromMilliseconds(150);
         private int _maxConnectionsPerHost = 6000;
+        private int _maxRequestsPerConnection = 32;
 
         public Func<JA3Fingerprint> FingerprintProvider { get; set; } =
             () => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome);
@@ -37,6 +38,8 @@ namespace Moljave.Http
         }
 
         public bool AllowAutoRedirect { get; set; } = true;
+
+        public bool EnableConnectionPooling { get; set; } = true;
 
         public int MaxAutomaticRedirections
         {
@@ -66,6 +69,12 @@ namespace Moljave.Http
         {
             get => _maxConnectionsPerHost;
             set => _maxConnectionsPerHost = value <= 0 ? 1 : value;
+        }
+
+        public int MaxRequestsPerConnection
+        {
+            get => _maxRequestsPerConnection;
+            set => _maxRequestsPerConnection = value <= 0 ? 1 : value;
         }
 
         public IList<Func<DelegatingHandler>> DelegatingHandlerFactories { get; } = new List<Func<DelegatingHandler>>();

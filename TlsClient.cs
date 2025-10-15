@@ -25,6 +25,7 @@ namespace Moljave.Http
         private Stream _transportStream;
         private SslStream _sslStream;
         private bool _disposed;
+        private int _usageCount;
 
         public TlsClient(
             string host,
@@ -53,6 +54,8 @@ namespace Moljave.Http
             {
                 throw new ArgumentNullException(nameof(requestBytes));
             }
+
+            Interlocked.Increment(ref _usageCount);
 
             var activeStream = await GetActiveStreamAsync(useTls, cancellationToken).ConfigureAwait(false);
 
@@ -662,6 +665,48 @@ namespace Moljave.Http
             _sslStream?.Dispose();
             _transportStream?.Dispose();
             _tcpClient?.Dispose();
+        }
+
+        internal bool IsConnectionReusable(int maxRequestsPerConnection)
+        {
+            if (_disposed)
+            {
+                return false;
+            }
+
+            if (maxRequestsPerConnection > 0 && Volatile.Read(ref _usageCount) >= maxRequestsPerConnection)
+            {
+                return false;
+            }
+
+            var client = _tcpClient?.Client;
+            if (client == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (!client.Connected)
+                {
+                    return false;
+                }
+
+                if (client.Poll(0, SelectMode.SelectRead) && client.Available == 0)
+                {
+                    return false;
+                }
+            }
+            catch (SocketException)
+            {
+                return false;
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
+
+            return true;
         }
     }
 }

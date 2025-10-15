@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Security;
@@ -156,16 +157,30 @@ namespace Moljave.Http
             var requestPayload = await HttpRequestStringifier.Stringify(request).ConfigureAwait(false);
 
             Exception lastException = null;
+            var port = uri.IsDefaultPort ? (useTls ? 443 : 80) : uri.Port;
 
             for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
-                using var tlsClient = new TlsClient(
-                    uri.Host,
-                    uri.IsDefaultPort ? (useTls ? 443 : 80) : uri.Port,
-                    fingerprint,
-                    proxyOptions?.Descriptor,
-                    tlsSettings,
-                    _options.CertificateValidationCallback);
+                using var lease = _options.EnableConnectionPooling
+                    ? TlsClientPool.Rent(
+                        uri.Host,
+                        port,
+                        useTls,
+                        fingerprint,
+                        proxyOptions?.Descriptor,
+                        tlsSettings,
+                        _options.CertificateValidationCallback,
+                        _options.MaxRequestsPerConnection,
+                        _options.MaxConnectionsPerHost)
+                    : TlsClientLease.CreateUnpooled(new TlsClient(
+                        uri.Host,
+                        port,
+                        fingerprint,
+                        proxyOptions?.Descriptor,
+                        tlsSettings,
+                        _options.CertificateValidationCallback));
+
+                var tlsClient = lease.Client;
 
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 if (timeout > TimeSpan.Zero)
@@ -178,14 +193,22 @@ namespace Moljave.Http
                     var responseBytes = await tlsClient.SendRequestAsync(requestPayload, linkedCts.Token, useTls).ConfigureAwait(false);
                     var response = HttpResponseParser.Parse(responseBytes);
                     response.RequestMessage = request;
+
+                    if (_options.EnableConnectionPooling)
+                    {
+                        lease.SetReturnToPool(ShouldKeepConnectionAlive(request, response));
+                    }
+
                     return response;
                 }
                 catch (OperationCanceledException) when (linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
+                    lease.SetReturnToPool(false);
                     throw new TimeoutException("The HTTP/1.1 request timed out.");
                 }
                 catch (Exception ex) when (ShouldRetry(ex, proxyOptions) && attempt < maxRetries)
                 {
+                    lease.SetReturnToPool(false);
                     lastException = ex;
                     await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                 }
@@ -383,6 +406,69 @@ namespace Moljave.Http
             }
 
             return handler;
+        }
+
+        private static bool ShouldKeepConnectionAlive(HttpRequestMessage request, HttpResponseMessage response)
+        {
+            if (request == null || response == null)
+            {
+                return false;
+            }
+
+            if (ContainsConnectionToken(request.Headers.Connection, "close") || ContainsConnectionToken(request.Headers.Connection, "upgrade"))
+            {
+                return false;
+            }
+
+            if (HasHeaderToken(request.Headers, "Proxy-Connection", "close"))
+            {
+                return false;
+            }
+
+            if (ContainsConnectionToken(response.Headers.Connection, "close") || ContainsConnectionToken(response.Headers.Connection, "upgrade"))
+            {
+                return false;
+            }
+
+            if (HasHeaderToken(response.Headers, "Proxy-Connection", "close"))
+            {
+                return false;
+            }
+
+            return response.Version?.Major >= 1;
+        }
+
+        private static bool ContainsConnectionToken(System.Collections.Generic.IEnumerable<string> values, string token)
+        {
+            if (values == null)
+            {
+                return false;
+            }
+
+            return values.Any(value => string.Equals(value, token, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool HasHeaderToken(System.Net.Http.Headers.HttpHeaders headers, string headerName, string token)
+        {
+            if (headers == null)
+            {
+                return false;
+            }
+
+            if (!headers.TryGetValues(headerName, out var values))
+            {
+                return false;
+            }
+
+            foreach (var value in values)
+            {
+                if (value.Split(',').Select(part => part.Trim()).Any(part => string.Equals(part, token, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static bool ShouldRetry(Exception exception, MojaveProxyOptions proxyOptions)
