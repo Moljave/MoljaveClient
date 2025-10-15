@@ -138,8 +138,19 @@ namespace Moljave.Http
                 NoDelay = true,
                 ReceiveBufferSize = 64 * 1024,
                 SendBufferSize = 64 * 1024,
-                LingerState = new LingerOption(enable: false, seconds: 0)
+                // Use an abortive close so sockets do not pile up in TIME_WAIT when running at high volume.
+                LingerState = new LingerOption(enable: true, seconds: 0)
             };
+
+            try
+            {
+                // Allow quickly reusing ephemeral ports on platforms that support it to avoid hitting per-process limits.
+                _tcpClient.Client?.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, optionValue: true);
+            }
+            catch (SocketException)
+            {
+                // Some platforms do not allow adjusting the reuse option on TCP clients.
+            }
 
             if (_proxy == null)
             {
