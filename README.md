@@ -1,11 +1,31 @@
 # MojaveHttpClient
 
-> **Raw HTTP/1.1 + TLS JA3 fingerprinting + Proxy + Cookies for .NET/NET Core**  
+> **Raw HTTP/1.1 + TLS JA3 fingerprinting + Proxy + Cookies for .NET/NET Core**
 > Modern, low-level HTTP client for advanced scraping, automation and pentesting scenarios.
+> **Production ready for Windows 11 environments.**
 
 ---
 
 [![.NET 7/8/9+ Compatible](https://img.shields.io/badge/.NET-6%2F7%2F8%2F9-green.svg)](https://dotnet.microsoft.com/)
+
+---
+
+## 🖥️ System Requirements
+
+- **Operating system:** Windows 11 (build 22000 or newer)
+- **Runtime:** .NET 6.0 or later
+
+The library validates the platform at runtime and will throw a `PlatformNotSupportedException` if it is used on unsupported operating systems. This avoids failures that were previously triggered when instantiating TLS policies on other platforms.
+
+---
+
+## ✅ Production Deployment Checklist
+
+- Build your application in **Release** configuration (`dotnet build -c Release`).
+- Run your automated tests against the Release build before deployment.
+- Ensure that all target machines run **Windows 11 build 22000+** with the latest security updates.
+- Configure monitoring/telemetry around HTTP request success and failure rates.
+- Keep TLS fingerprints rotated according to your security posture with `MojaveHttpClient.RotateFingerprint()`.
 
 ---
 
