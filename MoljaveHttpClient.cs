@@ -136,6 +136,19 @@ namespace Moljave.Http
             }
         }
 
+        public void UseRotatingProxyProvider(RotatingProxyProvider provider)
+        {
+            if (provider == null)
+            {
+                throw new ArgumentNullException(nameof(provider));
+            }
+
+            lock (_proxyLock)
+            {
+                _options.ProxyResolver = () => provider.GetNextProxy();
+            }
+        }
+
         public void ClearProxy() => UseProxy((WebProxy)null);
 
         public void ClearAllCookies() => _cookieManager.ClearAll();

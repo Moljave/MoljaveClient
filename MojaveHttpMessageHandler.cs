@@ -38,6 +38,7 @@ namespace Moljave.Http
 
             var currentRequest = request;
             var currentRedirectCount = redirectCount;
+            ProxyRotationContext proxyContext = null;
 
             while (true)
             {
@@ -45,12 +46,12 @@ namespace Moljave.Http
                 var useTls = string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase);
 
                 var requestOptions = currentRequest.GetMojaveOptions();
+                proxyContext ??= CreateProxyContext(requestOptions);
                 var effectiveTimeout = requestOptions?.Timeout ?? _options.DefaultTimeout;
                 var maxRedirects = requestOptions?.MaxAutomaticRedirections ?? _options.MaxAutomaticRedirections;
                 var cookieManager = requestOptions?.CookieManager ?? _options.CookieManager;
                 var fingerprint = requestOptions?.Fingerprint ?? _options.FingerprintProvider?.Invoke() ?? JA3Fingerprint.Default;
                 var tlsSettings = requestOptions?.TlsSettings ?? _options.TlsSettingsProvider?.Invoke() ?? MojaveTlsSettings.Default;
-                var proxyOptions = requestOptions?.Proxy ?? _options.ProxyResolver?.Invoke() ?? MojaveProxyOptions.NoProxy;
                 var maxRetries = Math.Max(0, requestOptions?.MaxConnectionRetries ?? _options.MaxConnectionRetries);
                 var retryDelay = requestOptions?.RetryDelay ?? _options.ConnectionRetryDelay;
                 if (retryDelay < TimeSpan.Zero)
@@ -79,8 +80,8 @@ namespace Moljave.Http
                 }
 
                 HttpResponseMessage response = ShouldUseHttp2(currentRequest)
-                    ? await SendHttp2Async(currentRequest, uri, effectiveTimeout, fingerprint, tlsSettings, proxyOptions, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false)
-                    : await SendHttp11Async(currentRequest, uri, useTls, effectiveTimeout, fingerprint, tlsSettings, proxyOptions, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false);
+                    ? await SendHttp2Async(currentRequest, uri, effectiveTimeout, fingerprint, tlsSettings, proxyContext, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false)
+                    : await SendHttp11Async(currentRequest, uri, useTls, effectiveTimeout, fingerprint, tlsSettings, proxyContext, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false);
 
                 if (cookieManager != null && response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
                 {
@@ -126,6 +127,17 @@ namespace Moljave.Http
             }
         }
 
+        private ProxyRotationContext CreateProxyContext(MojaveRequestOptions requestOptions)
+        {
+            if (requestOptions?.Proxy != null)
+            {
+                return ProxyRotationContext.FromOverride(requestOptions.Proxy);
+            }
+
+            var resolver = _options.ProxyResolver ?? (() => MojaveProxyOptions.NoProxy);
+            return ProxyRotationContext.FromResolver(resolver);
+        }
+
         private static bool IsRedirect(HttpStatusCode statusCode)
         {
             return statusCode == HttpStatusCode.Moved ||
@@ -152,7 +164,7 @@ namespace Moljave.Http
             TimeSpan timeout,
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings,
-            MojaveProxyOptions proxyOptions,
+            ProxyRotationContext proxyContext,
             int maxRetries,
             TimeSpan retryDelay,
             CancellationToken cancellationToken)
@@ -165,6 +177,7 @@ namespace Moljave.Http
 
             for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
+                var proxyOptions = proxyContext?.GetProxyForAttempt(attempt) ?? MojaveProxyOptions.NoProxy;
                 TlsClientLease lease = null;
                 CancellationTokenSource waitCts = null;
                 CancellationTokenSource linkedCts = null;
@@ -185,7 +198,7 @@ namespace Moljave.Http
                         useTls,
                         fingerprint,
                         tlsSettings,
-                        proxyOptions?.Descriptor,
+                        proxyOptions.Descriptor,
                         _options.CertificateValidationCallback,
                         _options.MaxConnectionsPerHost,
                         waitToken).ConfigureAwait(false);
@@ -210,17 +223,22 @@ namespace Moljave.Http
                         lease.MarkReusable();
                     }
 
+                    proxyContext?.NotifySuccess(proxyOptions);
                     return response;
                 }
                 catch (OperationCanceledException) when (linkedCts != null && linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
                     lease?.MarkUnusable();
-                    throw new TimeoutException("The HTTP/1.1 request timed out.");
+                    var timeoutException = new TimeoutException("The HTTP/1.1 request timed out.");
+                    proxyContext?.NotifyFailure(proxyOptions, timeoutException);
+                    throw timeoutException;
                 }
                 catch (OperationCanceledException) when (waitCts != null && waitCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
                     lease?.MarkUnusable();
-                    throw new TimeoutException("The HTTP/1.1 connection attempt timed out.");
+                    var timeoutException = new TimeoutException("The HTTP/1.1 connection attempt timed out.");
+                    proxyContext?.NotifyFailure(proxyOptions, timeoutException);
+                    throw timeoutException;
                 }
                 catch (Exception ex)
                 {
@@ -236,11 +254,13 @@ namespace Moljave.Http
                     if (attempt < maxRetries && ShouldRetry(ex, proxyOptions))
                     {
                         lastException = ex;
+                        proxyContext?.NotifyFailure(proxyOptions, ex);
                         await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
                     lastException = ex;
+                    proxyContext?.NotifyFailure(proxyOptions, ex);
                     throw;
                 }
                 finally
@@ -260,7 +280,7 @@ namespace Moljave.Http
             TimeSpan timeout,
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings,
-            MojaveProxyOptions proxyOptions,
+            ProxyRotationContext proxyContext,
             int maxRetries,
             TimeSpan retryDelay,
             CancellationToken cancellationToken)
@@ -269,6 +289,7 @@ namespace Moljave.Http
 
             for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
+                var proxyOptions = proxyContext?.GetProxyForAttempt(attempt) ?? MojaveProxyOptions.NoProxy;
                 using var handler = CreateHttp2Handler(uri, fingerprint, tlsSettings, proxyOptions);
                 ApplyHttp2ConnectTimeout(handler, timeout);
 
@@ -307,12 +328,15 @@ namespace Moljave.Http
                         }
 
                         finalResponse.Content = HttpContentUtilities.CreateContent(bodyBytes, contentHeaders, out _);
+                        proxyContext?.NotifySuccess(proxyOptions);
                         return finalResponse;
                     }
                 }
                 catch (OperationCanceledException) when (linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
-                    throw new TimeoutException("The HTTP/2 request timed out.");
+                    var timeoutException = new TimeoutException("The HTTP/2 request timed out.");
+                    proxyContext?.NotifyFailure(proxyOptions, timeoutException);
+                    throw timeoutException;
                 }
                 catch (AuthenticationException ex)
                 {
@@ -323,9 +347,10 @@ namespace Moljave.Http
                         continue;
                     }
 
-                    if (proxyOptions?.Descriptor == null)
+                    if (proxyOptions.Descriptor == null)
                     {
                         lastException = ex;
+                        proxyContext?.NotifyFailure(proxyOptions, ex);
                         throw;
                     }
 
@@ -337,10 +362,12 @@ namespace Moljave.Http
                     if (attempt < maxRetries && IsRetryableProxyError(proxyException))
                     {
                         lastException = proxyException;
+                        proxyContext?.NotifyFailure(proxyOptions, proxyException);
                         await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
+                    proxyContext?.NotifyFailure(proxyOptions, proxyException);
                     throw proxyException;
                 }
                 catch (HttpRequestException ex)
@@ -352,26 +379,30 @@ namespace Moljave.Http
                         continue;
                     }
 
-                    var transformed = proxyOptions?.Descriptor != null ? CreateProxyException(ex) : ex;
+                    var transformed = proxyOptions.Descriptor != null ? CreateProxyException(ex) : ex;
                     lastException = transformed;
 
                     if (transformed is ProxyException proxyException)
                     {
                         if (attempt < maxRetries && IsRetryableProxyError(proxyException))
                         {
+                            proxyContext?.NotifyFailure(proxyOptions, proxyException);
                             await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                             continue;
                         }
 
+                        proxyContext?.NotifyFailure(proxyOptions, proxyException);
                         throw proxyException;
                     }
 
                     if (attempt < maxRetries && ShouldRetry(transformed, proxyOptions))
                     {
+                        proxyContext?.NotifyFailure(proxyOptions, transformed);
                         await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
+                    proxyContext?.NotifyFailure(proxyOptions, transformed);
                     throw;
                 }
                 catch (Exception ex)
@@ -386,11 +417,13 @@ namespace Moljave.Http
                     if (attempt < maxRetries && ShouldRetry(ex, proxyOptions))
                     {
                         lastException = ex;
+                        proxyContext?.NotifyFailure(proxyOptions, ex);
                         await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
                     lastException = ex;
+                    proxyContext?.NotifyFailure(proxyOptions, ex);
                     throw;
                 }
             }

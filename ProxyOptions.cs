@@ -53,15 +53,28 @@ namespace Moljave.Http
         public static MojaveProxyOptions NoProxy { get; } = new(null);
 
         private MojaveProxyOptions(ProxyDescriptor descriptor)
+            : this(descriptor, null)
+        {
+        }
+
+        private MojaveProxyOptions(ProxyDescriptor descriptor, IProxyRotationListener rotationListener)
         {
             Descriptor = descriptor;
+            RotationListener = rotationListener;
         }
 
         public ProxyDescriptor Descriptor { get; }
         public bool HasProxy => Descriptor != null;
 
+        internal IProxyRotationListener RotationListener { get; }
+
         public static MojaveProxyOptions FromDescriptor(ProxyDescriptor descriptor) =>
             descriptor == null ? NoProxy : new MojaveProxyOptions(descriptor);
+
+        internal static MojaveProxyOptions CreateWithListener(
+            ProxyDescriptor descriptor,
+            IProxyRotationListener rotationListener) =>
+            descriptor == null ? NoProxy : new MojaveProxyOptions(descriptor, rotationListener);
 
         public static MojaveProxyOptions FromWebProxy(WebProxy proxy)
         {
@@ -82,6 +95,27 @@ namespace Moljave.Http
 
             var descriptor = new ProxyDescriptor(scheme, proxy.Address.Host, proxy.Address.Port, credentials);
             return new MojaveProxyOptions(descriptor);
+        }
+
+        internal static MojaveProxyOptions FromWebProxy(WebProxy proxy, IProxyRotationListener rotationListener)
+        {
+            if (proxy == null)
+            {
+                return NoProxy;
+            }
+
+            var scheme = proxy.Address.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
+                ? ProxyScheme.Https
+                : ProxyScheme.Http;
+
+            NetworkCredential credentials = null;
+            if (proxy.Credentials is NetworkCredential creds)
+            {
+                credentials = new NetworkCredential(creds.UserName, creds.Password);
+            }
+
+            var descriptor = new ProxyDescriptor(scheme, proxy.Address.Host, proxy.Address.Port, credentials);
+            return new MojaveProxyOptions(descriptor, rotationListener);
         }
     }
 }
