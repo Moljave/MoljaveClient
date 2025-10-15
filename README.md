@@ -2,7 +2,7 @@
 
 > **Raw HTTP/1.1 + TLS JA3 fingerprinting + Proxy + Cookies for .NET/NET Core**
 > Modern, low-level HTTP client for advanced scraping, automation and pentesting scenarios.
-> **Production ready for Windows 11 environments.**
+> **Production ready for Windows 10/11 environments.**
 
 ---
 
@@ -12,7 +12,7 @@
 
 ## 🖥️ System Requirements
 
-- **Operating system:** Windows 11 (build 22000 or newer)
+- **Operating system:** Windows 10 version 2004 (build 19041) or newer (including Windows 11)
 - **Runtime:** .NET 6.0 or later
 
 The library validates the platform at runtime and will throw a `PlatformNotSupportedException` if it is used on unsupported operating systems. This avoids failures that were previously triggered when instantiating TLS policies on other platforms.
@@ -23,7 +23,7 @@ The library validates the platform at runtime and will throw a `PlatformNotSuppo
 
 - Build your application in **Release** configuration (`dotnet build -c Release`).
 - Run your automated tests against the Release build before deployment.
-- Ensure that all target machines run **Windows 11 build 22000+** with the latest security updates.
+- Ensure that all target machines run **Windows 10 version 2004 (build 19041) or newer** with the latest security updates.
 - Configure monitoring/telemetry around HTTP request success and failure rates.
 - Keep TLS fingerprints rotated according to your security posture with `MojaveHttpClient.RotateFingerprint()`.
 

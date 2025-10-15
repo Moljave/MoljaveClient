@@ -45,7 +45,7 @@ namespace Moljave.Http
 
         public MojaveHttpClient(MojaveHttpClientOptions options)
         {
-            PlatformRequirements.EnsureWindows11();
+            PlatformRequirements.EnsureSupportedWindows();
 
             _options = options ?? throw new ArgumentNullException(nameof(options));
             _cookieManager = _options.CookieManager ?? new MojaveCookieManager();

@@ -4,11 +4,13 @@ namespace Moljave.Http
 {
     internal static class PlatformRequirements
     {
-        public static void EnsureWindows11()
+        public static void EnsureSupportedWindows()
         {
-            if (!OperatingSystem.IsWindows() || !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+            const int minimumBuild = 19041; // Windows 10 version 2004
+
+            if (!OperatingSystem.IsWindows() || !OperatingSystem.IsWindowsVersionAtLeast(10, 0, minimumBuild))
             {
-                throw new PlatformNotSupportedException("MojaveHttpClient supports only Windows 11 or later.");
+                throw new PlatformNotSupportedException("MojaveHttpClient requires Windows 10 version 2004 (build 19041) or newer.");
             }
         }
     }

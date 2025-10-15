@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Security.Authentication;
 using System.Text;
 using System.Threading;
@@ -14,6 +15,9 @@ namespace Moljave.Http
 {
     internal sealed class MojaveHttpMessageHandler : HttpMessageHandler
     {
+        private static readonly Lazy<PropertyInfo> s_connectTimeoutProperty = new(() =>
+            typeof(SocketsHttpHandler).GetProperty("ConnectTimeout", BindingFlags.Public | BindingFlags.Instance));
+
         private readonly MojaveHttpClientOptions _options;
         public MojaveHttpMessageHandler(MojaveHttpClientOptions options)
         {
@@ -218,11 +222,26 @@ namespace Moljave.Http
                     lease?.MarkUnusable();
                     throw new TimeoutException("The HTTP/1.1 connection attempt timed out.");
                 }
-                catch (Exception ex) when (ShouldRetry(ex, proxyOptions) && attempt < maxRetries)
+                catch (Exception ex)
                 {
                     lease?.MarkUnusable();
+
+                    if (TlsPlatformSupport.TryDisableCipherSuitesPolicy(ex))
+                    {
+                        lastException = ex;
+                        attempt--;
+                        continue;
+                    }
+
+                    if (attempt < maxRetries && ShouldRetry(ex, proxyOptions))
+                    {
+                        lastException = ex;
+                        await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+
                     lastException = ex;
-                    await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                    throw;
                 }
                 finally
                 {
@@ -251,10 +270,7 @@ namespace Moljave.Http
             for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
                 using var handler = CreateHttp2Handler(uri, fingerprint, tlsSettings, proxyOptions);
-                if (timeout > TimeSpan.Zero)
-                {
-                    handler.ConnectTimeout = timeout;
-                }
+                ApplyHttp2ConnectTimeout(handler, timeout);
 
                 using var invoker = new HttpMessageInvoker(handler, disposeHandler: true);
                 var http2Request = await CloneHttpRequestForHttp2Async(request).ConfigureAwait(false);
@@ -298,8 +314,21 @@ namespace Moljave.Http
                 {
                     throw new TimeoutException("The HTTP/2 request timed out.");
                 }
-                catch (AuthenticationException ex) when (proxyOptions?.Descriptor != null)
+                catch (AuthenticationException ex)
                 {
+                    if (TlsPlatformSupport.TryDisableCipherSuitesPolicy(ex))
+                    {
+                        lastException = ex;
+                        attempt--;
+                        continue;
+                    }
+
+                    if (proxyOptions?.Descriptor == null)
+                    {
+                        lastException = ex;
+                        throw;
+                    }
+
                     var proxyException = new ProxyException(
                         "Failed to establish a secure connection through the proxy.",
                         ProxyErrorReason.ConnectionFailed,
@@ -316,6 +345,13 @@ namespace Moljave.Http
                 }
                 catch (HttpRequestException ex)
                 {
+                    if (TlsPlatformSupport.TryDisableCipherSuitesPolicy(ex))
+                    {
+                        lastException = ex;
+                        attempt--;
+                        continue;
+                    }
+
                     var transformed = proxyOptions?.Descriptor != null ? CreateProxyException(ex) : ex;
                     lastException = transformed;
 
@@ -338,10 +374,24 @@ namespace Moljave.Http
 
                     throw;
                 }
-                catch (Exception ex) when (ShouldRetry(ex, proxyOptions) && attempt < maxRetries)
+                catch (Exception ex)
                 {
+                    if (TlsPlatformSupport.TryDisableCipherSuitesPolicy(ex))
+                    {
+                        lastException = ex;
+                        attempt--;
+                        continue;
+                    }
+
+                    if (attempt < maxRetries && ShouldRetry(ex, proxyOptions))
+                    {
+                        lastException = ex;
+                        await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+
                     lastException = ex;
-                    await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                    throw;
                 }
             }
 
@@ -424,6 +474,69 @@ namespace Moljave.Http
             }
 
             return handler;
+        }
+
+        private static void ApplyHttp2ConnectTimeout(SocketsHttpHandler handler, TimeSpan timeout)
+        {
+            if (handler == null || timeout <= TimeSpan.Zero)
+            {
+                return;
+            }
+
+            if (TrySetConnectTimeout(handler, timeout))
+            {
+                return;
+            }
+
+            if (handler.ConnectCallback != null)
+            {
+                return;
+            }
+
+            handler.ConnectCallback = async (context, token) =>
+            {
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                cts.CancelAfter(timeout);
+
+                var socket = new Socket(SocketType.Stream, ProtocolType.Tcp)
+                {
+                    NoDelay = true
+                };
+
+                try
+                {
+                    await socket.ConnectAsync(context.DnsEndPoint.Host, context.DnsEndPoint.Port).WaitAsync(cts.Token).ConfigureAwait(false);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch
+                {
+                    socket.Dispose();
+                    throw;
+                }
+                finally
+                {
+                    cts.Dispose();
+                }
+            };
+        }
+
+        private static bool TrySetConnectTimeout(SocketsHttpHandler handler, TimeSpan timeout)
+        {
+            var property = s_connectTimeoutProperty.Value;
+            if (property == null || !property.CanWrite)
+            {
+                return false;
+            }
+
+            try
+            {
+                property.SetValue(handler, timeout);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static bool ShouldRetry(Exception exception, MojaveProxyOptions proxyOptions)
