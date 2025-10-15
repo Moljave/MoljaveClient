@@ -224,6 +224,17 @@ namespace Moljave.Http
             {
                 throw new TimeoutException("The HTTP/2 request timed out.");
             }
+            catch (AuthenticationException ex) when (proxyOptions?.Descriptor != null)
+            {
+                throw new ProxyException(
+                    "Failed to establish a secure connection through the proxy.",
+                    ProxyErrorReason.ConnectionFailed,
+                    innerException: ex);
+            }
+            catch (HttpRequestException ex) when (proxyOptions?.Descriptor != null)
+            {
+                throw CreateProxyException(ex);
+            }
         }
 
         private async Task<HttpRequestMessage> CloneHttpRequestForHttp2Async(HttpRequestMessage request)
@@ -371,6 +382,78 @@ namespace Moljave.Http
                 : _options.CertificateValidationCallback;
 
             return sslOptions;
+        }
+
+        private static ProxyException CreateProxyException(HttpRequestException exception)
+        {
+            var statusCode = exception.StatusCode ?? ExtractStatusCodeFromMessage(exception.Message);
+
+            if (statusCode == HttpStatusCode.ProxyAuthenticationRequired)
+            {
+                return new ProxyException(
+                    "Proxy authentication required. Provide valid proxy credentials.",
+                    ProxyErrorReason.AuthenticationRequired,
+                    statusCode,
+                    exception);
+            }
+
+            if (statusCode == HttpStatusCode.Forbidden || statusCode == HttpStatusCode.Unauthorized)
+            {
+                return new ProxyException(
+                    "Proxy authentication failed. Verify the configured proxy username and password.",
+                    ProxyErrorReason.AuthenticationFailed,
+                    statusCode,
+                    exception);
+            }
+
+            if (exception.InnerException is AuthenticationException)
+            {
+                return new ProxyException(
+                    "Failed to establish a secure connection through the proxy.",
+                    ProxyErrorReason.ConnectionFailed,
+                    statusCode,
+                    exception);
+            }
+
+            var message = statusCode != null
+                ? $"Proxy request failed with status code {(int)statusCode} ({statusCode})."
+                : "Proxy request failed.";
+
+            return new ProxyException(message, ProxyErrorReason.ResponseError, statusCode, exception);
+        }
+
+        private static HttpStatusCode? ExtractStatusCodeFromMessage(string message)
+        {
+            if (string.IsNullOrEmpty(message))
+            {
+                return null;
+            }
+
+            const string marker = "status code '";
+            var index = message.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (index < 0)
+            {
+                return null;
+            }
+
+            var start = index + marker.Length;
+            var end = message.IndexOf('\'', start);
+            if (end <= start)
+            {
+                return null;
+            }
+
+            if (!int.TryParse(message.Substring(start, end - start), out var numericCode))
+            {
+                return null;
+            }
+
+            if (!Enum.IsDefined(typeof(HttpStatusCode), numericCode))
+            {
+                return null;
+            }
+
+            return (HttpStatusCode)numericCode;
         }
     }
 }
