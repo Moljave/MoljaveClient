@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Security;
+using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Text;
 using System.Threading;
@@ -45,6 +47,12 @@ namespace Moljave.Http
                 var fingerprint = requestOptions?.Fingerprint ?? _options.FingerprintProvider?.Invoke() ?? JA3Fingerprint.Default;
                 var tlsSettings = requestOptions?.TlsSettings ?? _options.TlsSettingsProvider?.Invoke() ?? MojaveTlsSettings.Default;
                 var proxyOptions = requestOptions?.Proxy ?? _options.ProxyResolver?.Invoke() ?? MojaveProxyOptions.NoProxy;
+                var maxRetries = Math.Max(0, requestOptions?.MaxConnectionRetries ?? _options.MaxConnectionRetries);
+                var retryDelay = requestOptions?.RetryDelay ?? _options.ConnectionRetryDelay;
+                if (retryDelay < TimeSpan.Zero)
+                {
+                    retryDelay = TimeSpan.Zero;
+                }
 
                 if (currentRequest.Content != null)
                 {
@@ -67,8 +75,8 @@ namespace Moljave.Http
                 }
 
                 HttpResponseMessage response = ShouldUseHttp2(currentRequest)
-                    ? await SendHttp2Async(currentRequest, uri, effectiveTimeout, fingerprint, tlsSettings, proxyOptions, cancellationToken).ConfigureAwait(false)
-                    : await SendHttp11Async(currentRequest, uri, useTls, effectiveTimeout, fingerprint, tlsSettings, proxyOptions, cancellationToken).ConfigureAwait(false);
+                    ? await SendHttp2Async(currentRequest, uri, effectiveTimeout, fingerprint, tlsSettings, proxyOptions, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false)
+                    : await SendHttp11Async(currentRequest, uri, useTls, effectiveTimeout, fingerprint, tlsSettings, proxyOptions, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false);
 
                 if (cookieManager != null && response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
                 {
@@ -141,35 +149,49 @@ namespace Moljave.Http
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings,
             MojaveProxyOptions proxyOptions,
+            int maxRetries,
+            TimeSpan retryDelay,
             CancellationToken cancellationToken)
         {
             var requestPayload = await HttpRequestStringifier.Stringify(request).ConfigureAwait(false);
 
-            using var tlsClient = new TlsClient(
-                uri.Host,
-                uri.IsDefaultPort ? (useTls ? 443 : 80) : uri.Port,
-                fingerprint,
-                proxyOptions?.Descriptor,
-                tlsSettings,
-                _options.CertificateValidationCallback);
+            Exception lastException = null;
 
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            if (timeout > TimeSpan.Zero)
+            for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
-                linkedCts.CancelAfter(timeout);
+                using var tlsClient = new TlsClient(
+                    uri.Host,
+                    uri.IsDefaultPort ? (useTls ? 443 : 80) : uri.Port,
+                    fingerprint,
+                    proxyOptions?.Descriptor,
+                    tlsSettings,
+                    _options.CertificateValidationCallback);
+
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                if (timeout > TimeSpan.Zero)
+                {
+                    linkedCts.CancelAfter(timeout);
+                }
+
+                try
+                {
+                    var responseBytes = await tlsClient.SendRequestAsync(requestPayload, linkedCts.Token, useTls).ConfigureAwait(false);
+                    var response = HttpResponseParser.Parse(responseBytes);
+                    response.RequestMessage = request;
+                    return response;
+                }
+                catch (OperationCanceledException) when (linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    throw new TimeoutException("The HTTP/1.1 request timed out.");
+                }
+                catch (Exception ex) when (ShouldRetry(ex, proxyOptions) && attempt < maxRetries)
+                {
+                    lastException = ex;
+                    await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                }
             }
 
-            try
-            {
-                var responseBytes = await tlsClient.SendRequestAsync(requestPayload, linkedCts.Token, useTls).ConfigureAwait(false);
-                var response = HttpResponseParser.Parse(responseBytes);
-                response.RequestMessage = request;
-                return response;
-            }
-            catch (OperationCanceledException) when (linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
-            {
-                throw new TimeoutException("The HTTP/1.1 request timed out.");
-            }
+            throw lastException ?? new HttpRequestException("The HTTP/1.1 request failed after retrying the connection.");
         }
 
         private async Task<HttpResponseMessage> SendHttp2Async(
@@ -179,62 +201,110 @@ namespace Moljave.Http
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings,
             MojaveProxyOptions proxyOptions,
+            int maxRetries,
+            TimeSpan retryDelay,
             CancellationToken cancellationToken)
         {
-            using var handler = CreateHttp2Handler(uri, fingerprint, tlsSettings, proxyOptions);
-            using var invoker = new HttpMessageInvoker(handler, disposeHandler: true);
-            var http2Request = await CloneHttpRequestForHttp2Async(request).ConfigureAwait(false);
+            Exception lastException = null;
 
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            if (timeout > TimeSpan.Zero)
+            for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
-                linkedCts.CancelAfter(timeout);
-            }
-
-            try
-            {
-                var response = await invoker.SendAsync(http2Request, linkedCts.Token).ConfigureAwait(false);
-
-                using (response)
+                using var handler = CreateHttp2Handler(uri, fingerprint, tlsSettings, proxyOptions);
+                if (timeout > TimeSpan.Zero)
                 {
-                    var bodyBytes = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-                    var finalResponse = new HttpResponseMessage(response.StatusCode)
-                    {
-                        Version = response.Version,
-                        ReasonPhrase = response.ReasonPhrase,
-                        RequestMessage = request
-                    };
+                    handler.ConnectTimeout = timeout;
+                }
 
-                    foreach (var header in response.Headers)
+                using var invoker = new HttpMessageInvoker(handler, disposeHandler: true);
+                var http2Request = await CloneHttpRequestForHttp2Async(request).ConfigureAwait(false);
+
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                if (timeout > TimeSpan.Zero)
+                {
+                    linkedCts.CancelAfter(timeout);
+                }
+
+                try
+                {
+                    var response = await invoker.SendAsync(http2Request, linkedCts.Token).ConfigureAwait(false);
+
+                    using (response)
                     {
-                        finalResponse.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                        var bodyBytes = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+                        var finalResponse = new HttpResponseMessage(response.StatusCode)
+                        {
+                            Version = response.Version,
+                            ReasonPhrase = response.ReasonPhrase,
+                            RequestMessage = request
+                        };
+
+                        foreach (var header in response.Headers)
+                        {
+                            finalResponse.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                        }
+
+                        var contentHeaders = new List<KeyValuePair<string, string>>();
+                        foreach (var header in response.Content.Headers)
+                        {
+                            contentHeaders.Add(new KeyValuePair<string, string>(header.Key, string.Join(", ", header.Value)));
+                        }
+
+                        finalResponse.Content = HttpContentUtilities.CreateContent(bodyBytes, contentHeaders, out _);
+                        return finalResponse;
+                    }
+                }
+                catch (OperationCanceledException) when (linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    throw new TimeoutException("The HTTP/2 request timed out.");
+                }
+                catch (AuthenticationException ex) when (proxyOptions?.Descriptor != null)
+                {
+                    var proxyException = new ProxyException(
+                        "Failed to establish a secure connection through the proxy.",
+                        ProxyErrorReason.ConnectionFailed,
+                        innerException: ex);
+
+                    if (attempt < maxRetries && IsRetryableProxyError(proxyException))
+                    {
+                        lastException = proxyException;
+                        await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                        continue;
                     }
 
-                    var contentHeaders = new List<KeyValuePair<string, string>>();
-                    foreach (var header in response.Content.Headers)
+                    throw proxyException;
+                }
+                catch (HttpRequestException ex)
+                {
+                    var transformed = proxyOptions?.Descriptor != null ? CreateProxyException(ex) : ex;
+                    lastException = transformed;
+
+                    if (transformed is ProxyException proxyException)
                     {
-                        contentHeaders.Add(new KeyValuePair<string, string>(header.Key, string.Join(", ", header.Value)));
+                        if (attempt < maxRetries && IsRetryableProxyError(proxyException))
+                        {
+                            await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                            continue;
+                        }
+
+                        throw proxyException;
                     }
 
-                    finalResponse.Content = HttpContentUtilities.CreateContent(bodyBytes, contentHeaders, out _);
-                    return finalResponse;
+                    if (attempt < maxRetries && ShouldRetry(transformed, proxyOptions))
+                    {
+                        await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    throw;
+                }
+                catch (Exception ex) when (ShouldRetry(ex, proxyOptions) && attempt < maxRetries)
+                {
+                    lastException = ex;
+                    await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                 }
             }
-            catch (OperationCanceledException) when (linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
-            {
-                throw new TimeoutException("The HTTP/2 request timed out.");
-            }
-            catch (AuthenticationException ex) when (proxyOptions?.Descriptor != null)
-            {
-                throw new ProxyException(
-                    "Failed to establish a secure connection through the proxy.",
-                    ProxyErrorReason.ConnectionFailed,
-                    innerException: ex);
-            }
-            catch (HttpRequestException ex) when (proxyOptions?.Descriptor != null)
-            {
-                throw CreateProxyException(ex);
-            }
+
+            throw lastException ?? new HttpRequestException("The HTTP/2 request failed after retrying the connection.");
         }
 
         private async Task<HttpRequestMessage> CloneHttpRequestForHttp2Async(HttpRequestMessage request)
@@ -274,7 +344,8 @@ namespace Moljave.Http
                 AllowAutoRedirect = false,
                 AutomaticDecompression = DecompressionMethods.None,
                 UseCookies = false,
-                EnableMultipleHttp2Connections = true
+                EnableMultipleHttp2Connections = true,
+                MaxConnectionsPerServer = Math.Max(_options.MaxConnectionsPerHost, 1)
             };
 
             handler.SslOptions = BuildHttp2SslOptions(uri.Host, fingerprint, tlsSettings);
@@ -314,6 +385,70 @@ namespace Moljave.Http
             return handler;
         }
 
+        private static bool ShouldRetry(Exception exception, MojaveProxyOptions proxyOptions)
+        {
+            if (exception is OperationCanceledException or TimeoutException)
+            {
+                return false;
+            }
+
+            if (exception is ProxyException proxyException)
+            {
+                return IsRetryableProxyError(proxyException);
+            }
+
+            if (exception is AuthenticationException)
+            {
+                return true;
+            }
+
+            if (exception is IOException or SocketException)
+            {
+                return true;
+            }
+
+            if (exception is HttpRequestException httpRequestException)
+            {
+                if (httpRequestException.StatusCode.HasValue)
+                {
+                    return false;
+                }
+
+                return httpRequestException.InnerException != null
+                    ? ShouldRetry(httpRequestException.InnerException, proxyOptions)
+                    : true;
+            }
+
+            return exception.InnerException != null && ShouldRetry(exception.InnerException, proxyOptions);
+        }
+
+        private static bool IsRetryableProxyError(ProxyException proxyException)
+        {
+            return proxyException != null && proxyException.Reason is ProxyErrorReason.ConnectionFailed or ProxyErrorReason.ProtocolError;
+        }
+
+        private static async Task DelayForRetryAsync(int attempt, TimeSpan baseDelay, CancellationToken cancellationToken)
+        {
+            if (baseDelay <= TimeSpan.Zero)
+            {
+                return;
+            }
+
+            var scaledDelay = CalculateDelay(baseDelay, attempt);
+            if (scaledDelay > TimeSpan.Zero)
+            {
+                await Task.Delay(scaledDelay, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        private static TimeSpan CalculateDelay(TimeSpan baseDelay, int attempt)
+        {
+            var multiplier = Math.Pow(2, Math.Max(0, attempt));
+            var delayMilliseconds = baseDelay.TotalMilliseconds * multiplier;
+            var cappedMilliseconds = Math.Min(delayMilliseconds, 2000);
+            return TimeSpan.FromMilliseconds(cappedMilliseconds);
+        }
+
         private SslClientAuthenticationOptions BuildHttp2SslOptions(
             string host,
             JA3Fingerprint fingerprint,
@@ -331,7 +466,7 @@ namespace Moljave.Http
                 ClientCertificates = new System.Security.Cryptography.X509Certificates.X509CertificateCollection()
             };
 
-            if (cipherSuites?.Length > 0)
+            if (cipherSuites?.Length > 0 && TlsPlatformSupport.SupportsCipherSuitesPolicy())
             {
                 try
                 {
@@ -339,7 +474,7 @@ namespace Moljave.Http
                 }
                 catch (PlatformNotSupportedException)
                 {
-                    // The current platform does not support configuring cipher suites.
+                    // Some environments may still reject custom cipher suites despite the capability check.
                 }
             }
 

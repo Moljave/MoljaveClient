@@ -135,7 +135,10 @@ namespace Moljave.Http
 
             _tcpClient = new TcpClient
             {
-                NoDelay = true
+                NoDelay = true,
+                ReceiveBufferSize = 64 * 1024,
+                SendBufferSize = 64 * 1024,
+                LingerState = new LingerOption(enable: false, seconds: 0)
             };
 
             if (_proxy == null)
@@ -601,7 +604,7 @@ namespace Moljave.Http
             };
 
             var cipherSuites = _fingerprint.GetCipherSuites();
-            if (cipherSuites?.Length > 0)
+            if (cipherSuites?.Length > 0 && TlsPlatformSupport.SupportsCipherSuitesPolicy())
             {
                 try
                 {
@@ -609,7 +612,7 @@ namespace Moljave.Http
                 }
                 catch (PlatformNotSupportedException)
                 {
-                    // The current platform does not support configuring cipher suites.
+                    // Some environments may still reject custom cipher suites despite the capability check.
                 }
             }
 

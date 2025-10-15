@@ -10,6 +10,9 @@ namespace Moljave.Http
     {
         private TimeSpan _defaultTimeout = TimeSpan.FromSeconds(30);
         private int _maxAutomaticRedirections = 10;
+        private int _maxConnectionRetries = 2;
+        private TimeSpan _connectionRetryDelay = TimeSpan.FromMilliseconds(150);
+        private int _maxConnectionsPerHost = 6000;
 
         public Func<JA3Fingerprint> FingerprintProvider { get; set; } =
             () => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome);
@@ -45,6 +48,24 @@ namespace Moljave.Http
         {
             get => _defaultTimeout;
             set => _defaultTimeout = value <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : value;
+        }
+
+        public int MaxConnectionRetries
+        {
+            get => _maxConnectionRetries;
+            set => _maxConnectionRetries = value < 0 ? 0 : value;
+        }
+
+        public TimeSpan ConnectionRetryDelay
+        {
+            get => _connectionRetryDelay;
+            set => _connectionRetryDelay = value < TimeSpan.Zero ? TimeSpan.Zero : value;
+        }
+
+        public int MaxConnectionsPerHost
+        {
+            get => _maxConnectionsPerHost;
+            set => _maxConnectionsPerHost = value <= 0 ? 1 : value;
         }
 
         public IList<Func<DelegatingHandler>> DelegatingHandlerFactories { get; } = new List<Func<DelegatingHandler>>();
@@ -91,6 +112,8 @@ namespace Moljave.Http
         public bool? AllowAutoRedirect { get; set; }
         public int? MaxAutomaticRedirections { get; set; }
         public MojaveCookieManager CookieManager { get; set; }
+        public int? MaxConnectionRetries { get; set; }
+        public TimeSpan? RetryDelay { get; set; }
 
         internal MojaveRequestOptions Clone() => new()
         {
@@ -100,7 +123,9 @@ namespace Moljave.Http
             Timeout = Timeout,
             AllowAutoRedirect = AllowAutoRedirect,
             MaxAutomaticRedirections = MaxAutomaticRedirections,
-            CookieManager = CookieManager
+            CookieManager = CookieManager,
+            MaxConnectionRetries = MaxConnectionRetries,
+            RetryDelay = RetryDelay
         };
     }
 

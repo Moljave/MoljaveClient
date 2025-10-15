@@ -77,6 +77,9 @@ class Program
 var options = new MojaveHttpClientOptions
 {
     DefaultTimeout = TimeSpan.FromSeconds(25),
+    MaxConnectionRetries = 2,
+    ConnectionRetryDelay = TimeSpan.FromMilliseconds(200),
+    MaxConnectionsPerHost = 6000,
     ProxyResolver = () => ProxyParser.TryParse(GetNextProxy(), out var proxy)
         ? proxy
         : MojaveProxyOptions.NoProxy
