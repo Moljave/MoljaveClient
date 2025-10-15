@@ -424,7 +424,7 @@ namespace Moljave.Http
             return clone;
         }
 
-        private HttpMessageHandler CreateHttp2Handler(
+        private SocketsHttpHandler CreateHttp2Handler(
             Uri uri,
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings,
