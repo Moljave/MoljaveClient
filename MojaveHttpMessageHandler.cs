@@ -154,40 +154,81 @@ namespace Moljave.Http
             CancellationToken cancellationToken)
         {
             var requestPayload = await HttpRequestStringifier.Stringify(request).ConfigureAwait(false);
+            var requestWantsClose = RequestWantsConnectionClose(request);
+            var targetPort = uri.IsDefaultPort ? (useTls ? 443 : 80) : uri.Port;
 
             Exception lastException = null;
 
             for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
-                using var tlsClient = new TlsClient(
-                    uri.Host,
-                    uri.IsDefaultPort ? (useTls ? 443 : 80) : uri.Port,
-                    fingerprint,
-                    proxyOptions?.Descriptor,
-                    tlsSettings,
-                    _options.CertificateValidationCallback);
-
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                if (timeout > TimeSpan.Zero)
-                {
-                    linkedCts.CancelAfter(timeout);
-                }
+                TlsClientLease lease = null;
+                CancellationTokenSource waitCts = null;
+                CancellationTokenSource linkedCts = null;
 
                 try
                 {
-                    var responseBytes = await tlsClient.SendRequestAsync(requestPayload, linkedCts.Token, useTls).ConfigureAwait(false);
+                    var waitToken = cancellationToken;
+                    if (timeout > TimeSpan.Zero)
+                    {
+                        waitCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        waitCts.CancelAfter(timeout);
+                        waitToken = waitCts.Token;
+                    }
+
+                    lease = await TlsConnectionPool.Shared.RentAsync(
+                        uri.Host,
+                        targetPort,
+                        useTls,
+                        fingerprint,
+                        tlsSettings,
+                        proxyOptions?.Descriptor,
+                        _options.CertificateValidationCallback,
+                        _options.MaxConnectionsPerHost,
+                        waitToken).ConfigureAwait(false);
+
+                    linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    if (timeout > TimeSpan.Zero)
+                    {
+                        linkedCts.CancelAfter(timeout);
+                    }
+
+                    var responseBytes = await lease.Client.SendRequestAsync(requestPayload, linkedCts.Token, useTls).ConfigureAwait(false);
                     var response = HttpResponseParser.Parse(responseBytes);
                     response.RequestMessage = request;
+
+                    var shouldClose = requestWantsClose || ResponseIndicatesConnectionClose(response);
+                    if (shouldClose)
+                    {
+                        lease.MarkUnusable();
+                    }
+                    else
+                    {
+                        lease.MarkReusable();
+                    }
+
                     return response;
                 }
-                catch (OperationCanceledException) when (linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (linkedCts != null && linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
+                    lease?.MarkUnusable();
                     throw new TimeoutException("The HTTP/1.1 request timed out.");
+                }
+                catch (OperationCanceledException) when (waitCts != null && waitCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    lease?.MarkUnusable();
+                    throw new TimeoutException("The HTTP/1.1 connection attempt timed out.");
                 }
                 catch (Exception ex) when (ShouldRetry(ex, proxyOptions) && attempt < maxRetries)
                 {
+                    lease?.MarkUnusable();
                     lastException = ex;
                     await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    linkedCts?.Dispose();
+                    waitCts?.Dispose();
+                    lease?.Dispose();
                 }
             }
 
@@ -420,6 +461,57 @@ namespace Moljave.Http
             }
 
             return exception.InnerException != null && ShouldRetry(exception.InnerException, proxyOptions);
+        }
+
+        private static bool RequestWantsConnectionClose(HttpRequestMessage request)
+        {
+            if (request == null)
+            {
+                return false;
+            }
+
+            if (request.Headers.ConnectionClose == true)
+            {
+                return true;
+            }
+
+            foreach (var value in request.Headers.Connection)
+            {
+                if (string.Equals(value, "close", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool ResponseIndicatesConnectionClose(HttpResponseMessage response)
+        {
+            if (response == null)
+            {
+                return true;
+            }
+
+            if (response.Headers.ConnectionClose == true)
+            {
+                return true;
+            }
+
+            foreach (var value in response.Headers.Connection)
+            {
+                if (string.Equals(value, "close", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            if (response.Version != null && response.Version.Major == 1 && response.Version.Minor == 0)
+            {
+                return true;
+            }
+
+            return false;
         }
 
         private static bool IsRetryableProxyError(ProxyException proxyException)

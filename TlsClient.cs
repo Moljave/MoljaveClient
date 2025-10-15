@@ -177,6 +177,43 @@ namespace Moljave.Http
             return _sslStream;
         }
 
+        public bool IsReusable
+        {
+            get
+            {
+                if (_disposed)
+                {
+                    return false;
+                }
+
+                var client = _tcpClient;
+                if (client == null)
+                {
+                    return false;
+                }
+
+                try
+                {
+                    var socket = client.Client;
+                    if (socket == null || !socket.Connected)
+                    {
+                        return false;
+                    }
+
+                    if (socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0)
+                    {
+                        return false;
+                    }
+
+                    return true;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return false;
+                }
+            }
+        }
+
         private static void ConfigureForHighVolumeReuse(TcpClient client)
         {
             if (client == null)
@@ -716,6 +753,9 @@ namespace Moljave.Http
             _sslStream?.Dispose();
             _transportStream?.Dispose();
             _tcpClient?.Dispose();
+            _sslStream = null;
+            _transportStream = null;
+            _tcpClient = null;
         }
     }
 }
