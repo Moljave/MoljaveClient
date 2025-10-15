@@ -87,12 +87,14 @@ namespace Moljave.Http
 
             var headersText = Encoding.ASCII.GetString(headerBytes);
             int contentLength = 0;
+            bool hasContentLength = false;
             bool isChunked = false;
 
             foreach (var line in headersText.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries))
             {
                 if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
                 {
+                    hasContentLength = true;
                     int.TryParse(line[15..].Trim(), out contentLength);
                 }
 
@@ -107,7 +109,7 @@ namespace Moljave.Http
             {
                 await ReadChunkedBodyAsync(activeStream, memoryStream, cancellationToken).ConfigureAwait(false);
             }
-            else if (contentLength > 0)
+            else if (hasContentLength)
             {
                 await ReadFixedBodyAsync(activeStream, memoryStream, contentLength, cancellationToken).ConfigureAwait(false);
             }
