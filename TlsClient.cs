@@ -176,24 +176,43 @@ namespace Moljave.Http
             var proxyHost = _proxy.Host;
             var proxyPort = _proxy.Port;
 
-            await _tcpClient.ConnectAsync(proxyHost, proxyPort).WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _tcpClient.ConnectAsync(proxyHost, proxyPort).WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is SocketException or IOException)
+            {
+                throw new ProxyException($"Failed to connect to proxy {proxyHost}:{proxyPort}.", ProxyErrorReason.ConnectionFailed, innerException: ex);
+            }
+
             var stream = _tcpClient.GetStream();
 
-            switch (_proxy.Scheme)
+            try
             {
-                case ProxyScheme.Http:
-                case ProxyScheme.Https:
-                    _transportStream = await EstablishHttpTunnelAsync(stream, cancellationToken).ConfigureAwait(false);
-                    break;
-                case ProxyScheme.Socks4:
-                case ProxyScheme.Socks4a:
-                    _transportStream = await EstablishSocks4TunnelAsync(stream, cancellationToken).ConfigureAwait(false);
-                    break;
-                case ProxyScheme.Socks5:
-                    _transportStream = await EstablishSocks5TunnelAsync(stream, cancellationToken).ConfigureAwait(false);
-                    break;
-                default:
-                    throw new NotSupportedException($"Proxy scheme {_proxy.Scheme} is not supported.");
+                switch (_proxy.Scheme)
+                {
+                    case ProxyScheme.Http:
+                    case ProxyScheme.Https:
+                        _transportStream = await EstablishHttpTunnelAsync(stream, cancellationToken).ConfigureAwait(false);
+                        break;
+                    case ProxyScheme.Socks4:
+                    case ProxyScheme.Socks4a:
+                        _transportStream = await EstablishSocks4TunnelAsync(stream, cancellationToken).ConfigureAwait(false);
+                        break;
+                    case ProxyScheme.Socks5:
+                        _transportStream = await EstablishSocks5TunnelAsync(stream, cancellationToken).ConfigureAwait(false);
+                        break;
+                    default:
+                        throw new ProxyException($"Proxy scheme {_proxy.Scheme} is not supported.", ProxyErrorReason.Unsupported);
+                }
+            }
+            catch (ProxyException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is IOException or SocketException)
+            {
+                throw new ProxyException("Proxy negotiation failed.", ProxyErrorReason.ProtocolError, innerException: ex);
             }
         }
 
@@ -216,10 +235,15 @@ namespace Moljave.Http
             await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
 
             var response = await ReadHttpProxyResponseAsync(stream, cancellationToken).ConfigureAwait(false);
-            if (!response.StartsWith("HTTP/1.1 200", StringComparison.OrdinalIgnoreCase) &&
-                !response.StartsWith("HTTP/1.0 200", StringComparison.OrdinalIgnoreCase))
+            if (!IsSuccessfulHttpProxyResponse(response, out var statusCode, out var statusLine))
             {
-                throw new IOException($"Proxy CONNECT failed: {response.Split('\n')[0]}".Trim());
+                var reason = statusCode == HttpStatusCode.ProxyAuthenticationRequired
+                    ? ProxyErrorReason.AuthenticationRequired
+                    : ProxyErrorReason.ResponseError;
+                var message = statusLine != null
+                    ? $"Proxy CONNECT failed: {statusLine}"
+                    : "Proxy CONNECT failed with an invalid response.";
+                throw new ProxyException(message, reason, statusCode);
             }
 
             return stream;
@@ -289,7 +313,7 @@ namespace Moljave.Http
 
             if (response[1] != 0x5A)
             {
-                throw new IOException($"SOCKS4 proxy connection failed with status {response[1]:X2}");
+                throw new ProxyException($"SOCKS4 proxy connection failed: {DescribeSocks4Status(response[1])}", ProxyErrorReason.ResponseError);
             }
 
             return stream;
@@ -310,14 +334,14 @@ namespace Moljave.Http
 
             if (methodSelection[0] != 0x05)
             {
-                throw new IOException("SOCKS5 proxy handshake failed: invalid version");
+                throw new ProxyException("SOCKS5 proxy handshake failed: invalid version.", ProxyErrorReason.ProtocolError);
             }
 
             if (methodSelection[1] == 0x02)
             {
                 if (!hasCredentials)
                 {
-                    throw new IOException("SOCKS5 proxy requires authentication but no credentials were provided.");
+                    throw new ProxyException("SOCKS5 proxy requires authentication but no credentials were provided.", ProxyErrorReason.AuthenticationRequired);
                 }
 
                 var creds = (NetworkCredential)_proxy.Credentials;
@@ -339,12 +363,12 @@ namespace Moljave.Http
                 await ReadExactAsync(stream, authResponse, cancellationToken).ConfigureAwait(false);
                 if (authResponse[1] != 0x00)
                 {
-                    throw new IOException("SOCKS5 proxy authentication failed");
+                    throw new ProxyException("SOCKS5 proxy authentication failed.", ProxyErrorReason.AuthenticationFailed);
                 }
             }
             else if (methodSelection[1] == 0xFF)
             {
-                throw new IOException("SOCKS5 proxy does not accept provided authentication methods");
+                throw new ProxyException("SOCKS5 proxy does not accept provided authentication methods.", ProxyErrorReason.AuthenticationFailed);
             }
 
             var (addressType, addressPayload) = BuildSocks5Address();
@@ -367,7 +391,7 @@ namespace Moljave.Http
 
             if (responseHeader[1] != 0x00)
             {
-                throw new IOException($"SOCKS5 proxy connect failed with status {responseHeader[1]:X2}");
+                throw new ProxyException($"SOCKS5 proxy connect failed: {DescribeSocks5Status(responseHeader[1])}", ProxyErrorReason.ResponseError);
             }
 
             var skipLength = responseHeader[3] switch
@@ -385,6 +409,60 @@ namespace Moljave.Http
             }
 
             return stream;
+        }
+
+        private static bool IsSuccessfulHttpProxyResponse(string response, out HttpStatusCode? statusCode, out string statusLine)
+        {
+            statusCode = null;
+            statusLine = null;
+
+            if (string.IsNullOrWhiteSpace(response))
+            {
+                return false;
+            }
+
+            var separator = response.IndexOf('\n');
+            statusLine = separator >= 0 ? response[..separator].Trim() : response.Trim();
+            var parts = statusLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            if (parts.Length < 2 || !int.TryParse(parts[1], out var code))
+            {
+                return false;
+            }
+
+            if (Enum.IsDefined(typeof(HttpStatusCode), code))
+            {
+                statusCode = (HttpStatusCode)code;
+            }
+
+            return code == 200;
+        }
+
+        private static string DescribeSocks4Status(byte status)
+        {
+            return status switch
+            {
+                0x5B => "Request rejected or failed.",
+                0x5C => "Request rejected: cannot connect to identd on the client.",
+                0x5D => "Request rejected: client identd could not confirm the user ID.",
+                _ => $"Unknown status 0x{status:X2}."
+            };
+        }
+
+        private static string DescribeSocks5Status(byte status)
+        {
+            return status switch
+            {
+                0x01 => "General SOCKS server failure.",
+                0x02 => "Connection not allowed by ruleset.",
+                0x03 => "Network unreachable.",
+                0x04 => "Host unreachable.",
+                0x05 => "Connection refused by destination host.",
+                0x06 => "TTL expired.",
+                0x07 => "Command not supported.",
+                0x08 => "Address type not supported.",
+                _ => $"Unknown status 0x{status:X2}."
+            };
         }
 
         private (byte Type, byte[] Payload) BuildSocks5Address()
