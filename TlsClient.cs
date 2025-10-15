@@ -142,15 +142,7 @@ namespace Moljave.Http
                 LingerState = new LingerOption(enable: true, seconds: 0)
             };
 
-            try
-            {
-                // Allow quickly reusing ephemeral ports on platforms that support it to avoid hitting per-process limits.
-                _tcpClient.Client?.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, optionValue: true);
-            }
-            catch (SocketException)
-            {
-                // Some platforms do not allow adjusting the reuse option on TCP clients.
-            }
+            ConfigureForHighVolumeReuse(_tcpClient);
 
             if (_proxy == null)
             {
@@ -183,6 +175,68 @@ namespace Moljave.Http
             var authenticationOptions = BuildAuthenticationOptions();
             await _sslStream.AuthenticateAsClientAsync(authenticationOptions, cancellationToken).ConfigureAwait(false);
             return _sslStream;
+        }
+
+        private static void ConfigureForHighVolumeReuse(TcpClient client)
+        {
+            if (client == null)
+            {
+                return;
+            }
+
+            try
+            {
+                client.ExclusiveAddressUse = false;
+            }
+            catch (SocketException)
+            {
+                // Some environments do not allow toggling exclusive address use on TCP clients.
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+            catch (PlatformNotSupportedException)
+            {
+                // Ignore when the platform does not expose the option.
+            }
+
+            var socket = client.Client;
+            if (socket == null)
+            {
+                return;
+            }
+
+            try
+            {
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, optionValue: true);
+            }
+            catch (SocketException)
+            {
+                // Ignore when the platform forbids enabling address reuse.
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+
+            try
+            {
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseUnicastPort, optionValue: true);
+            }
+            catch (SocketException)
+            {
+                // Older Windows builds may not allow configuring unicast port reuse.
+            }
+            catch (PlatformNotSupportedException)
+            {
+            }
+            catch (NotSupportedException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
 
         private async Task ConnectThroughProxyAsync(CancellationToken cancellationToken)
