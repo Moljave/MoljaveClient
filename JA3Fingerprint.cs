@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net.Security;
 using System.Security.Authentication;
@@ -44,7 +45,21 @@ namespace Moljave.Http
 
         public TlsCipherSuite[] GetCipherSuites()
         {
-            return CipherSuites.Select(CipherSuiteConverter.GetCipherSuite).ToArray();
+            if (CipherSuites == null || CipherSuites.Length == 0)
+            {
+                return Array.Empty<TlsCipherSuite>();
+            }
+
+            var supportedSuites = new List<TlsCipherSuite>(CipherSuites.Length);
+            foreach (var cipherSuiteId in CipherSuites)
+            {
+                if (CipherSuiteConverter.TryGetCipherSuite(cipherSuiteId, out var cipherSuite))
+                {
+                    supportedSuites.Add(cipherSuite);
+                }
+            }
+
+            return supportedSuites.ToArray();
         }
 
         public string[] GetApplicationProtocols()

@@ -322,7 +322,14 @@ namespace Moljave.Http
 
             if (cipherSuites?.Length > 0)
             {
-                sslOptions.CipherSuitesPolicy = new CipherSuitesPolicy(cipherSuites);
+                try
+                {
+                    sslOptions.CipherSuitesPolicy = new CipherSuitesPolicy(cipherSuites);
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    // The current platform does not support configuring cipher suites.
+                }
             }
 
             var protocols = new List<SslApplicationProtocol>();

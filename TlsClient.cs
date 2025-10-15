@@ -523,7 +523,14 @@ namespace Moljave.Http
             var cipherSuites = _fingerprint.GetCipherSuites();
             if (cipherSuites?.Length > 0)
             {
-                options.CipherSuitesPolicy = new CipherSuitesPolicy(cipherSuites);
+                try
+                {
+                    options.CipherSuitesPolicy = new CipherSuitesPolicy(cipherSuites);
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    // The current platform does not support configuring cipher suites.
+                }
             }
 
             if (applicationProtocols != null)

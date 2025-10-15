@@ -25,9 +25,26 @@ namespace Moljave.Http
             { 53, TlsCipherSuite.TLS_RSA_WITH_AES_256_CBC_SHA }
         };
 
+        public static bool TryGetCipherSuite(int cipherSuiteId, out TlsCipherSuite cipherSuite)
+        {
+            if (_cipherSuiteMap.TryGetValue(cipherSuiteId, out cipherSuite))
+            {
+                return true;
+            }
+
+            if (cipherSuiteId >= 0 && cipherSuiteId <= ushort.MaxValue)
+            {
+                cipherSuite = (TlsCipherSuite)(ushort)cipherSuiteId;
+                return true;
+            }
+
+            cipherSuite = default;
+            return false;
+        }
+
         public static TlsCipherSuite GetCipherSuite(int cipherSuiteId)
         {
-            if (_cipherSuiteMap.TryGetValue(cipherSuiteId, out var cipherSuite)) return cipherSuite;
+            if (TryGetCipherSuite(cipherSuiteId, out var cipherSuite)) return cipherSuite;
             throw new ArgumentException($"Unsupported cipher suite ID: {cipherSuiteId}", nameof(cipherSuiteId));
         }
     }
