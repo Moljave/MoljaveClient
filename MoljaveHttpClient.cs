@@ -30,7 +30,7 @@ namespace Moljave.Http
 
         private Uri _baseAddress;
         private Version _defaultRequestVersion = s_defaultRequestVersion;
-        private HttpVersionPolicy _defaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
+        private int _defaultVersionPolicy = (int)HttpVersionPolicy.RequestVersionOrHigher;
         private long _maxResponseContentBufferSize = int.MaxValue;
         private bool _disposed;
 
@@ -115,8 +115,8 @@ namespace Moljave.Http
 
         public HttpVersionPolicy DefaultVersionPolicy
         {
-            get => Volatile.Read(ref _defaultVersionPolicy);
-            set => Volatile.Write(ref _defaultVersionPolicy, value);
+            get => (HttpVersionPolicy)Volatile.Read(ref _defaultVersionPolicy);
+            set => Volatile.Write(ref _defaultVersionPolicy, (int)value);
         }
 
         public long MaxResponseContentBufferSize
