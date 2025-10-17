@@ -251,17 +251,19 @@ namespace Moljave.Http
                         continue;
                     }
 
-                    if (attempt < maxRetries && ShouldRetry(ex, proxyOptions))
+                    var transformed = NormalizeProxyException(ex, proxyOptions);
+
+                    if (attempt < maxRetries && ShouldRetry(transformed, proxyOptions))
                     {
-                        lastException = ex;
-                        proxyContext?.NotifyFailure(proxyOptions, ex);
+                        lastException = transformed;
+                        proxyContext?.NotifyFailure(proxyOptions, transformed);
                         await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
-                    lastException = ex;
-                    proxyContext?.NotifyFailure(proxyOptions, ex);
-                    throw;
+                    lastException = transformed;
+                    proxyContext?.NotifyFailure(proxyOptions, transformed);
+                    throw transformed;
                 }
                 finally
                 {
@@ -379,7 +381,7 @@ namespace Moljave.Http
                         continue;
                     }
 
-                    var transformed = proxyOptions.Descriptor != null ? CreateProxyException(ex) : ex;
+                    var transformed = NormalizeProxyException(ex, proxyOptions);
                     lastException = transformed;
 
                     if (transformed is ProxyException proxyException)
@@ -403,7 +405,7 @@ namespace Moljave.Http
                     }
 
                     proxyContext?.NotifyFailure(proxyOptions, transformed);
-                    throw;
+                    throw transformed;
                 }
                 catch (Exception ex)
                 {
@@ -414,17 +416,19 @@ namespace Moljave.Http
                         continue;
                     }
 
-                    if (attempt < maxRetries && ShouldRetry(ex, proxyOptions))
+                    var transformed = NormalizeProxyException(ex, proxyOptions);
+
+                    if (attempt < maxRetries && ShouldRetry(transformed, proxyOptions))
                     {
-                        lastException = ex;
-                        proxyContext?.NotifyFailure(proxyOptions, ex);
+                        lastException = transformed;
+                        proxyContext?.NotifyFailure(proxyOptions, transformed);
                         await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
-                    lastException = ex;
-                    proxyContext?.NotifyFailure(proxyOptions, ex);
-                    throw;
+                    lastException = transformed;
+                    proxyContext?.NotifyFailure(proxyOptions, transformed);
+                    throw transformed;
                 }
             }
 
@@ -663,6 +667,50 @@ namespace Moljave.Http
         private static bool IsRetryableProxyError(ProxyException proxyException)
         {
             return proxyException != null && proxyException.Reason is ProxyErrorReason.ConnectionFailed or ProxyErrorReason.ProtocolError;
+        }
+
+        private static Exception NormalizeProxyException(Exception exception, MojaveProxyOptions proxyOptions)
+        {
+            if (exception == null || proxyOptions?.Descriptor == null || exception is ProxyException)
+            {
+                return exception;
+            }
+
+            switch (exception)
+            {
+                case HttpRequestException httpRequestException:
+                    return CreateProxyException(httpRequestException);
+                case AuthenticationException authenticationException:
+                    return new ProxyException(
+                        "Failed to establish a secure connection through the proxy.",
+                        ProxyErrorReason.ConnectionFailed,
+                        innerException: authenticationException);
+                case TimeoutException timeoutException:
+                    return new ProxyException(
+                        "The proxy did not respond within the allotted timeout.",
+                        ProxyErrorReason.ConnectionFailed,
+                        innerException: timeoutException);
+                case SocketException or IOException:
+                    return new ProxyException(
+                        "Failed to communicate with the proxy server.",
+                        ProxyErrorReason.ConnectionFailed,
+                        innerException: exception);
+                case WebException webException:
+                    {
+                        var statusCode = (webException.Response as HttpWebResponse)?.StatusCode;
+                        var reason = webException.Status == WebExceptionStatus.ProtocolError
+                            ? ProxyErrorReason.ProtocolError
+                            : ProxyErrorReason.ConnectionFailed;
+
+                        return new ProxyException(
+                            webException.Message,
+                            reason,
+                            statusCode,
+                            webException);
+                    }
+                default:
+                    return exception;
+            }
         }
 
         private static async Task DelayForRetryAsync(int attempt, TimeSpan baseDelay, CancellationToken cancellationToken)

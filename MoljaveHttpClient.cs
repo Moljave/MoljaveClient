@@ -1,6 +1,8 @@
 using System;
+using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -8,17 +10,28 @@ namespace Moljave.Http
 {
     public sealed class MojaveHttpClient : IDisposable
     {
+        private static readonly Version s_defaultRequestVersion = HttpVersion.Version11;
+
         private readonly MojaveHttpClientOptions _options;
         private readonly HttpMessageInvoker _invoker;
         private readonly MojaveCookieManager _cookieManager;
         private readonly object _fingerprintLock = new();
         private readonly object _proxyLock = new();
+        private readonly HttpRequestMessage _defaultRequest = new();
+        private readonly HttpRequestHeaders _defaultRequestHeaders;
+
         private Func<JA3Fingerprint> _fingerprintFactory;
         private JA3Fingerprint _currentFingerprint;
+
         private Func<MojaveProxyOptions> _defaultProxyResolver;
         private Func<MojaveProxyOptions> _overrideProxyResolver;
         private MojaveProxyOptions _staticProxyOptions;
         private bool _proxyEnabled = true;
+
+        private Uri _baseAddress;
+        private Version _defaultRequestVersion = s_defaultRequestVersion;
+        private HttpVersionPolicy _defaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
+        private long _maxResponseContentBufferSize = int.MaxValue;
         private bool _disposed;
 
         public MojaveHttpClient()
@@ -59,6 +72,8 @@ namespace Moljave.Http
             _cookieManager = _options.CookieManager ?? new MojaveCookieManager();
             _options.CookieManager = _cookieManager;
 
+            _defaultRequestHeaders = _defaultRequest.Headers;
+
             InitializeFingerprint(_options.FingerprintProvider);
             _options.FingerprintProvider = ResolveFingerprint;
 
@@ -66,6 +81,62 @@ namespace Moljave.Http
             _options.ProxyResolver = ResolveProxy;
 
             _invoker = new HttpMessageInvoker(_options.BuildHandlerPipeline(), disposeHandler: true);
+        }
+
+        public Uri BaseAddress
+        {
+            get => Volatile.Read(ref _baseAddress);
+            set
+            {
+                if (value != null && !value.IsAbsoluteUri)
+                {
+                    throw new ArgumentException("BaseAddress must be an absolute URI.", nameof(value));
+                }
+
+                Volatile.Write(ref _baseAddress, value);
+            }
+        }
+
+        public HttpRequestHeaders DefaultRequestHeaders => _defaultRequestHeaders;
+
+        public Version DefaultRequestVersion
+        {
+            get => Volatile.Read(ref _defaultRequestVersion);
+            set
+            {
+                if (value == null)
+                {
+                    throw new ArgumentNullException(nameof(value));
+                }
+
+                Volatile.Write(ref _defaultRequestVersion, value);
+            }
+        }
+
+        public HttpVersionPolicy DefaultVersionPolicy
+        {
+            get => Volatile.Read(ref _defaultVersionPolicy);
+            set => Volatile.Write(ref _defaultVersionPolicy, value);
+        }
+
+        public long MaxResponseContentBufferSize
+        {
+            get => Volatile.Read(ref _maxResponseContentBufferSize);
+            set
+            {
+                if (value < 0)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(value), value, "The buffer size cannot be negative.");
+                }
+
+                Volatile.Write(ref _maxResponseContentBufferSize, value);
+            }
+        }
+
+        public TimeSpan Timeout
+        {
+            get => _options.DefaultTimeout;
+            set => _options.DefaultTimeout = value;
         }
 
         public bool AllowAutoRedirect
@@ -80,10 +151,22 @@ namespace Moljave.Http
             set => _options.MaxAutomaticRedirections = value;
         }
 
-        public TimeSpan DefaultTimeout
+        public int MaxConnectionRetries
         {
-            get => _options.DefaultTimeout;
-            set => _options.DefaultTimeout = value;
+            get => _options.MaxConnectionRetries;
+            set => _options.MaxConnectionRetries = value;
+        }
+
+        public TimeSpan ConnectionRetryDelay
+        {
+            get => _options.ConnectionRetryDelay;
+            set => _options.ConnectionRetryDelay = value;
+        }
+
+        public int MaxConnectionsPerHost
+        {
+            get => _options.MaxConnectionsPerHost;
+            set => _options.MaxConnectionsPerHost = value;
         }
 
         public CookieContainer CookieContainer
@@ -93,6 +176,172 @@ namespace Moljave.Http
         }
 
         public MojaveCookieManager CookieManager => _cookieManager;
+
+        public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
+            => SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);
+
+        public async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            HttpCompletionOption completionOption,
+            CancellationToken cancellationToken = default)
+        {
+            if (completionOption is not HttpCompletionOption.ResponseContentRead and not HttpCompletionOption.ResponseHeadersRead)
+            {
+                throw new ArgumentOutOfRangeException(nameof(completionOption));
+            }
+
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(MojaveHttpClient));
+            }
+
+            if (request == null)
+            {
+                throw new ArgumentNullException(nameof(request));
+            }
+
+            PrepareRequest(request);
+            ApplyDefaultRequestOptions(request);
+
+            HttpResponseMessage response = await _invoker.SendAsync(request, cancellationToken).ConfigureAwait(false);
+
+            if (completionOption == HttpCompletionOption.ResponseContentRead)
+            {
+                await EnsureContentBufferedAsync(response, cancellationToken).ConfigureAwait(false);
+            }
+
+            return response;
+        }
+
+        public Task<HttpResponseMessage> GetAsync(string requestUri)
+            => GetAsync(CreateUri(requestUri), HttpCompletionOption.ResponseContentRead, CancellationToken.None);
+
+        public Task<HttpResponseMessage> GetAsync(string requestUri, HttpCompletionOption completionOption)
+            => GetAsync(CreateUri(requestUri), completionOption, CancellationToken.None);
+
+        public Task<HttpResponseMessage> GetAsync(string requestUri, CancellationToken cancellationToken)
+            => GetAsync(CreateUri(requestUri), HttpCompletionOption.ResponseContentRead, cancellationToken);
+
+        public Task<HttpResponseMessage> GetAsync(string requestUri, HttpCompletionOption completionOption, CancellationToken cancellationToken)
+            => GetAsync(CreateUri(requestUri), completionOption, cancellationToken);
+
+        public Task<HttpResponseMessage> GetAsync(Uri requestUri)
+            => GetAsync(requestUri, HttpCompletionOption.ResponseContentRead, CancellationToken.None);
+
+        public Task<HttpResponseMessage> GetAsync(Uri requestUri, HttpCompletionOption completionOption)
+            => GetAsync(requestUri, completionOption, CancellationToken.None);
+
+        public async Task<HttpResponseMessage> GetAsync(Uri requestUri, CancellationToken cancellationToken)
+            => await GetAsync(requestUri, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+
+        public async Task<HttpResponseMessage> GetAsync(Uri requestUri, HttpCompletionOption completionOption, CancellationToken cancellationToken)
+        {
+            using var request = CreateRequestMessage(HttpMethod.Get, requestUri);
+            return await SendAsync(request, completionOption, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task<string> GetStringAsync(string requestUri)
+            => await GetStringAsync(CreateUri(requestUri), CancellationToken.None).ConfigureAwait(false);
+
+        public async Task<string> GetStringAsync(string requestUri, CancellationToken cancellationToken)
+            => await GetStringAsync(CreateUri(requestUri), cancellationToken).ConfigureAwait(false);
+
+        public async Task<string> GetStringAsync(Uri requestUri)
+            => await GetStringAsync(requestUri, CancellationToken.None).ConfigureAwait(false);
+
+        public async Task<string> GetStringAsync(Uri requestUri, CancellationToken cancellationToken)
+        {
+            using var response = await GetAsync(requestUri, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        }
+
+        public async Task<byte[]> GetByteArrayAsync(string requestUri)
+            => await GetByteArrayAsync(CreateUri(requestUri), CancellationToken.None).ConfigureAwait(false);
+
+        public async Task<byte[]> GetByteArrayAsync(string requestUri, CancellationToken cancellationToken)
+            => await GetByteArrayAsync(CreateUri(requestUri), cancellationToken).ConfigureAwait(false);
+
+        public async Task<byte[]> GetByteArrayAsync(Uri requestUri)
+            => await GetByteArrayAsync(requestUri, CancellationToken.None).ConfigureAwait(false);
+
+        public async Task<byte[]> GetByteArrayAsync(Uri requestUri, CancellationToken cancellationToken)
+        {
+            using var response = await GetAsync(requestUri, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            return await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        }
+
+        public async Task<Stream> GetStreamAsync(string requestUri)
+            => await GetStreamAsync(CreateUri(requestUri), CancellationToken.None).ConfigureAwait(false);
+
+        public async Task<Stream> GetStreamAsync(string requestUri, CancellationToken cancellationToken)
+            => await GetStreamAsync(CreateUri(requestUri), cancellationToken).ConfigureAwait(false);
+
+        public async Task<Stream> GetStreamAsync(Uri requestUri)
+            => await GetStreamAsync(requestUri, CancellationToken.None).ConfigureAwait(false);
+
+        public async Task<Stream> GetStreamAsync(Uri requestUri, CancellationToken cancellationToken)
+        {
+            var response = await GetAsync(requestUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                response.EnsureSuccessStatusCode();
+                return await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                response.Dispose();
+                throw;
+            }
+        }
+
+        public Task<HttpResponseMessage> PostAsync(string requestUri, HttpContent content)
+            => PostAsync(CreateUri(requestUri), content, CancellationToken.None);
+
+        public Task<HttpResponseMessage> PostAsync(string requestUri, HttpContent content, CancellationToken cancellationToken)
+            => PostAsync(CreateUri(requestUri), content, cancellationToken);
+
+        public Task<HttpResponseMessage> PostAsync(Uri requestUri, HttpContent content)
+            => PostAsync(requestUri, content, CancellationToken.None);
+
+        public async Task<HttpResponseMessage> PostAsync(Uri requestUri, HttpContent content, CancellationToken cancellationToken)
+        {
+            using var request = CreateRequestMessage(HttpMethod.Post, requestUri);
+            request.Content = content;
+            return await SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+        }
+
+        public Task<HttpResponseMessage> PutAsync(string requestUri, HttpContent content)
+            => PutAsync(CreateUri(requestUri), content, CancellationToken.None);
+
+        public Task<HttpResponseMessage> PutAsync(string requestUri, HttpContent content, CancellationToken cancellationToken)
+            => PutAsync(CreateUri(requestUri), content, cancellationToken);
+
+        public Task<HttpResponseMessage> PutAsync(Uri requestUri, HttpContent content)
+            => PutAsync(requestUri, content, CancellationToken.None);
+
+        public async Task<HttpResponseMessage> PutAsync(Uri requestUri, HttpContent content, CancellationToken cancellationToken)
+        {
+            using var request = CreateRequestMessage(HttpMethod.Put, requestUri);
+            request.Content = content;
+            return await SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+        }
+
+        public Task<HttpResponseMessage> DeleteAsync(string requestUri)
+            => DeleteAsync(CreateUri(requestUri), CancellationToken.None);
+
+        public Task<HttpResponseMessage> DeleteAsync(string requestUri, CancellationToken cancellationToken)
+            => DeleteAsync(CreateUri(requestUri), cancellationToken);
+
+        public Task<HttpResponseMessage> DeleteAsync(Uri requestUri)
+            => DeleteAsync(requestUri, CancellationToken.None);
+
+        public async Task<HttpResponseMessage> DeleteAsync(Uri requestUri, CancellationToken cancellationToken)
+        {
+            using var request = CreateRequestMessage(HttpMethod.Delete, requestUri);
+            return await SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+        }
 
         public void RotateFingerprint()
         {
@@ -232,32 +481,121 @@ namespace Moljave.Http
 
             _disposed = true;
             _invoker.Dispose();
+            _defaultRequest.Dispose();
         }
 
-        public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
-            => SendAsync(request, _options.DefaultTimeout, cancellationToken);
-
-        public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, TimeSpan timeout, CancellationToken cancellationToken = default)
+        private void PrepareRequest(HttpRequestMessage request)
         {
-            if (_disposed)
+            if (request.RequestUri == null)
             {
-                throw new ObjectDisposedException(nameof(MojaveHttpClient));
+                var baseAddress = BaseAddress;
+                if (baseAddress == null)
+                {
+                    throw new InvalidOperationException("The request URI must be absolute or BaseAddress must be set.");
+                }
+
+                request.RequestUri = baseAddress;
+            }
+            else if (!request.RequestUri.IsAbsoluteUri)
+            {
+                var baseAddress = BaseAddress;
+                if (baseAddress == null)
+                {
+                    throw new InvalidOperationException("The request URI must be absolute or BaseAddress must be set.");
+                }
+
+                request.RequestUri = new Uri(baseAddress, request.RequestUri);
             }
 
-            if (request == null)
+            if (request.Version == null || request.Version == s_defaultRequestVersion)
             {
-                throw new ArgumentNullException(nameof(request));
+                request.Version = DefaultRequestVersion;
             }
 
+            if (request.VersionPolicy == HttpVersionPolicy.RequestVersionOrLower)
+            {
+                request.VersionPolicy = DefaultVersionPolicy;
+            }
+
+            ApplyDefaultHeaders(request);
+        }
+
+        private void ApplyDefaultHeaders(HttpRequestMessage request)
+        {
+            if (_defaultRequestHeaders == null)
+            {
+                return;
+            }
+
+            foreach (var header in _defaultRequestHeaders)
+            {
+                if (!request.Headers.TryAddWithoutValidation(header.Key, header.Value))
+                {
+                    request.Content?.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                }
+            }
+        }
+
+        private void ApplyDefaultRequestOptions(HttpRequestMessage request)
+        {
             request.ConfigureMojaveOptions(options =>
             {
-                if (!options.Timeout.HasValue)
-                {
-                    options.Timeout = timeout;
-                }
+                options.Timeout ??= _options.DefaultTimeout;
+                options.AllowAutoRedirect ??= _options.AllowAutoRedirect;
+                options.MaxAutomaticRedirections ??= _options.MaxAutomaticRedirections;
+                options.CookieManager ??= _options.CookieManager;
+                options.MaxConnectionRetries ??= _options.MaxConnectionRetries;
+                options.RetryDelay ??= _options.ConnectionRetryDelay;
             });
+        }
 
-            return _invoker.SendAsync(request, cancellationToken);
+        private async Task EnsureContentBufferedAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+        {
+            if (response?.Content == null)
+            {
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var maxBufferSize = Volatile.Read(ref _maxResponseContentBufferSize);
+            if (maxBufferSize <= 0)
+            {
+                await response.Content.LoadIntoBufferAsync().ConfigureAwait(false);
+            }
+            else
+            {
+                await response.Content.LoadIntoBufferAsync(maxBufferSize).ConfigureAwait(false);
+            }
+        }
+
+        private static Uri CreateUri(string requestUri)
+        {
+            if (requestUri == null)
+            {
+                throw new ArgumentNullException(nameof(requestUri));
+            }
+
+            return new Uri(requestUri, UriKind.RelativeOrAbsolute);
+        }
+
+        private HttpRequestMessage CreateRequestMessage(HttpMethod method, Uri requestUri)
+        {
+            if (method == null)
+            {
+                throw new ArgumentNullException(nameof(method));
+            }
+
+            if (requestUri == null)
+            {
+                throw new ArgumentNullException(nameof(requestUri));
+            }
+
+            return new HttpRequestMessage(method, requestUri)
+            {
+                Version = DefaultRequestVersion,
+                VersionPolicy = DefaultVersionPolicy
+            };
         }
 
         private void InitializeProxy(Func<MojaveProxyOptions> proxyResolver)

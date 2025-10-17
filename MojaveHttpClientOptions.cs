@@ -3,16 +3,18 @@ using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Net.Security;
+using System.Threading;
 
 namespace Moljave.Http
 {
     public sealed class MojaveHttpClientOptions
     {
-        private TimeSpan _defaultTimeout = TimeSpan.FromSeconds(30);
+        private long _defaultTimeoutTicks = TimeSpan.FromSeconds(30).Ticks;
+        private int _allowAutoRedirect = 1;
         private int _maxAutomaticRedirections = 10;
         private int _maxConnectionRetries = 2;
-        private TimeSpan _connectionRetryDelay = TimeSpan.FromMilliseconds(150);
-        private int _maxConnectionsPerHost = 6000;
+        private long _connectionRetryDelayTicks = TimeSpan.FromMilliseconds(150).Ticks;
+        private int _maxConnectionsPerHost = 15000;
 
         public Func<JA3Fingerprint> FingerprintProvider { get; set; } =
             () => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome);
@@ -36,36 +38,60 @@ namespace Moljave.Http
             set => (_cookieManager ??= new MojaveCookieManager()).ReplaceWith(value ?? new CookieContainer());
         }
 
-        public bool AllowAutoRedirect { get; set; } = true;
+        public bool AllowAutoRedirect
+        {
+            get => Volatile.Read(ref _allowAutoRedirect) == 1;
+            set => Interlocked.Exchange(ref _allowAutoRedirect, value ? 1 : 0);
+        }
 
         public int MaxAutomaticRedirections
         {
-            get => _maxAutomaticRedirections;
-            set => _maxAutomaticRedirections = value < 0 ? 0 : value;
+            get => Volatile.Read(ref _maxAutomaticRedirections);
+            set
+            {
+                var sanitized = value < 0 ? 0 : value;
+                Interlocked.Exchange(ref _maxAutomaticRedirections, sanitized);
+            }
         }
 
         public TimeSpan DefaultTimeout
         {
-            get => _defaultTimeout;
-            set => _defaultTimeout = value <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : value;
+            get => TimeSpan.FromTicks(Volatile.Read(ref _defaultTimeoutTicks));
+            set
+            {
+                var effective = value <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : value;
+                Interlocked.Exchange(ref _defaultTimeoutTicks, effective.Ticks);
+            }
         }
 
         public int MaxConnectionRetries
         {
-            get => _maxConnectionRetries;
-            set => _maxConnectionRetries = value < 0 ? 0 : value;
+            get => Volatile.Read(ref _maxConnectionRetries);
+            set
+            {
+                var effective = value < 0 ? 0 : value;
+                Interlocked.Exchange(ref _maxConnectionRetries, effective);
+            }
         }
 
         public TimeSpan ConnectionRetryDelay
         {
-            get => _connectionRetryDelay;
-            set => _connectionRetryDelay = value < TimeSpan.Zero ? TimeSpan.Zero : value;
+            get => TimeSpan.FromTicks(Volatile.Read(ref _connectionRetryDelayTicks));
+            set
+            {
+                var effective = value < TimeSpan.Zero ? TimeSpan.Zero : value;
+                Interlocked.Exchange(ref _connectionRetryDelayTicks, effective.Ticks);
+            }
         }
 
         public int MaxConnectionsPerHost
         {
-            get => _maxConnectionsPerHost;
-            set => _maxConnectionsPerHost = value <= 0 ? 1 : value;
+            get => Volatile.Read(ref _maxConnectionsPerHost);
+            set
+            {
+                var effective = value <= 0 ? 1 : value;
+                Interlocked.Exchange(ref _maxConnectionsPerHost, effective);
+            }
         }
 
         public IList<Func<DelegatingHandler>> DelegatingHandlerFactories { get; } = new List<Func<DelegatingHandler>>();
