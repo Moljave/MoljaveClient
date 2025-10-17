@@ -294,7 +294,7 @@ namespace Moljave.Http
             }
         }
 
-        private static MojaveProxyOptions InvokeResolver(Func<MojaveProxyOptions> resolver)
+        private MojaveProxyOptions InvokeResolver(Func<MojaveProxyOptions> resolver)
         {
             if (resolver == null)
             {
@@ -307,10 +307,36 @@ namespace Moljave.Http
             }
             catch (Exception ex)
             {
-                throw new ProxyException(
+                var proxyException = new ProxyException(
                     "The proxy resolver threw an exception.",
                     ProxyErrorReason.Unsupported,
                     innerException: ex);
+
+                LogProxyError(MojaveProxyOptions.NoProxy, proxyException);
+                throw proxyException;
+            }
+        }
+
+        private void LogProxyError(MojaveProxyOptions proxyOptions, Exception exception, int attempt = -1, bool willRetry = false)
+        {
+            if (exception == null)
+            {
+                return;
+            }
+
+            var logger = _options.ProxyErrorLogger;
+            if (logger == null)
+            {
+                return;
+            }
+
+            try
+            {
+                logger(new ProxyErrorLogEntry(proxyOptions, exception, attempt, willRetry));
+            }
+            catch
+            {
+                // Ignore logging failures to avoid interfering with request execution.
             }
         }
 

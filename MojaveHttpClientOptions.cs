@@ -22,6 +22,9 @@ namespace Moljave.Http
         public Func<MojaveProxyOptions> ProxyResolver { get; set; }
             = () => MojaveProxyOptions.NoProxy;
 
+        public Action<ProxyErrorLogEntry> ProxyErrorLogger { get; set; }
+            = null;
+
         private MojaveCookieManager _cookieManager = new();
 
         public MojaveCookieManager CookieManager

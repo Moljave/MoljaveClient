@@ -231,6 +231,7 @@ namespace Moljave.Http
                     lease?.MarkUnusable();
                     var timeoutException = new TimeoutException("The HTTP/1.1 request timed out.");
                     proxyContext?.NotifyFailure(proxyOptions, timeoutException);
+                    LogProxyFailure(proxyOptions, timeoutException, attempt, willRetry: false);
                     throw timeoutException;
                 }
                 catch (OperationCanceledException) when (waitCts != null && waitCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
@@ -238,6 +239,7 @@ namespace Moljave.Http
                     lease?.MarkUnusable();
                     var timeoutException = new TimeoutException("The HTTP/1.1 connection attempt timed out.");
                     proxyContext?.NotifyFailure(proxyOptions, timeoutException);
+                    LogProxyFailure(proxyOptions, timeoutException, attempt, willRetry: false);
                     throw timeoutException;
                 }
                 catch (Exception ex)
@@ -255,12 +257,14 @@ namespace Moljave.Http
                     {
                         lastException = ex;
                         proxyContext?.NotifyFailure(proxyOptions, ex);
+                        LogProxyFailure(proxyOptions, ex, attempt, willRetry: true);
                         await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
                     lastException = ex;
                     proxyContext?.NotifyFailure(proxyOptions, ex);
+                    LogProxyFailure(proxyOptions, ex, attempt, willRetry: false);
                     throw;
                 }
                 finally
@@ -336,6 +340,7 @@ namespace Moljave.Http
                 {
                     var timeoutException = new TimeoutException("The HTTP/2 request timed out.");
                     proxyContext?.NotifyFailure(proxyOptions, timeoutException);
+                    LogProxyFailure(proxyOptions, timeoutException, attempt, willRetry: false);
                     throw timeoutException;
                 }
                 catch (AuthenticationException ex)
@@ -363,11 +368,13 @@ namespace Moljave.Http
                     {
                         lastException = proxyException;
                         proxyContext?.NotifyFailure(proxyOptions, proxyException);
+                        LogProxyFailure(proxyOptions, proxyException, attempt, willRetry: true);
                         await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
                     proxyContext?.NotifyFailure(proxyOptions, proxyException);
+                    LogProxyFailure(proxyOptions, proxyException, attempt, willRetry: false);
                     throw proxyException;
                 }
                 catch (HttpRequestException ex)
@@ -387,22 +394,26 @@ namespace Moljave.Http
                         if (attempt < maxRetries && IsRetryableProxyError(proxyException))
                         {
                             proxyContext?.NotifyFailure(proxyOptions, proxyException);
+                            LogProxyFailure(proxyOptions, proxyException, attempt, willRetry: true);
                             await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                             continue;
                         }
 
                         proxyContext?.NotifyFailure(proxyOptions, proxyException);
+                        LogProxyFailure(proxyOptions, proxyException, attempt, willRetry: false);
                         throw proxyException;
                     }
 
                     if (attempt < maxRetries && ShouldRetry(transformed, proxyOptions))
                     {
                         proxyContext?.NotifyFailure(proxyOptions, transformed);
+                        LogProxyFailure(proxyOptions, transformed, attempt, willRetry: true);
                         await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
                     proxyContext?.NotifyFailure(proxyOptions, transformed);
+                    LogProxyFailure(proxyOptions, transformed, attempt, willRetry: false);
                     throw;
                 }
                 catch (Exception ex)
@@ -418,12 +429,14 @@ namespace Moljave.Http
                     {
                         lastException = ex;
                         proxyContext?.NotifyFailure(proxyOptions, ex);
+                        LogProxyFailure(proxyOptions, ex, attempt, willRetry: true);
                         await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
                     lastException = ex;
                     proxyContext?.NotifyFailure(proxyOptions, ex);
+                    LogProxyFailure(proxyOptions, ex, attempt, willRetry: false);
                     throw;
                 }
             }
@@ -685,6 +698,34 @@ namespace Moljave.Http
             var delayMilliseconds = baseDelay.TotalMilliseconds * multiplier;
             var cappedMilliseconds = Math.Min(delayMilliseconds, 2000);
             return TimeSpan.FromMilliseconds(cappedMilliseconds);
+        }
+
+        private void LogProxyFailure(MojaveProxyOptions proxyOptions, Exception exception, int attempt, bool willRetry)
+        {
+            if (exception == null)
+            {
+                return;
+            }
+
+            var logger = _options.ProxyErrorLogger;
+            if (logger == null)
+            {
+                return;
+            }
+
+            if (proxyOptions?.Descriptor == null)
+            {
+                return;
+            }
+
+            try
+            {
+                logger(new ProxyErrorLogEntry(proxyOptions, exception, attempt, willRetry));
+            }
+            catch
+            {
+                // Swallow logging failures.
+            }
         }
 
         private SslClientAuthenticationOptions BuildHttp2SslOptions(
