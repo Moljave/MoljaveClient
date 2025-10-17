@@ -176,7 +176,7 @@ namespace Moljave.Http
             }
 
             _sslStream = new SslStream(transportStream, leaveInnerStreamOpen: false, GetValidationCallback());
-            var authenticationOptions = BuildAuthenticationOptions();
+            var authenticationOptions = BuildAuthenticationOptions(_host);
             await _sslStream.AuthenticateAsClientAsync(authenticationOptions, cancellationToken).ConfigureAwait(false);
             return _sslStream;
         }
@@ -294,22 +294,28 @@ namespace Moljave.Http
                 throw new ProxyException($"Failed to connect to proxy {proxyHost}:{proxyPort}.", ProxyErrorReason.ConnectionFailed, innerException: ex);
             }
 
-            var stream = _tcpClient.GetStream();
+            var networkStream = _tcpClient.GetStream();
+            Stream activeStream = networkStream;
 
             try
             {
+                if (_proxy.Scheme == ProxyScheme.Https)
+                {
+                    activeStream = await WrapProxyConnectionInTlsAsync(activeStream, cancellationToken).ConfigureAwait(false);
+                }
+
                 switch (_proxy.Scheme)
                 {
                     case ProxyScheme.Http:
                     case ProxyScheme.Https:
-                        _transportStream = await EstablishHttpTunnelAsync(stream, cancellationToken).ConfigureAwait(false);
+                        _transportStream = await EstablishHttpTunnelAsync(activeStream, cancellationToken).ConfigureAwait(false);
                         break;
                     case ProxyScheme.Socks4:
                     case ProxyScheme.Socks4a:
-                        _transportStream = await EstablishSocks4TunnelAsync(stream, cancellationToken).ConfigureAwait(false);
+                        _transportStream = await EstablishSocks4TunnelAsync(networkStream, cancellationToken).ConfigureAwait(false);
                         break;
                     case ProxyScheme.Socks5:
-                        _transportStream = await EstablishSocks5TunnelAsync(stream, cancellationToken).ConfigureAwait(false);
+                        _transportStream = await EstablishSocks5TunnelAsync(networkStream, cancellationToken).ConfigureAwait(false);
                         break;
                     default:
                         throw new ProxyException($"Proxy scheme {_proxy.Scheme} is not supported.", ProxyErrorReason.Unsupported);
@@ -319,13 +325,17 @@ namespace Moljave.Http
             {
                 throw;
             }
+            catch (AuthenticationException ex)
+            {
+                throw new ProxyException("Proxy TLS negotiation failed.", ProxyErrorReason.AuthenticationFailed, innerException: ex);
+            }
             catch (Exception ex) when (ex is IOException or SocketException)
             {
                 throw new ProxyException("Proxy negotiation failed.", ProxyErrorReason.ProtocolError, innerException: ex);
             }
         }
 
-        private async Task<Stream> EstablishHttpTunnelAsync(NetworkStream stream, CancellationToken cancellationToken)
+        private async Task<Stream> EstablishHttpTunnelAsync(Stream stream, CancellationToken cancellationToken)
         {
             var authority = GetProxyAuthority();
             var builder = new StringBuilder();
@@ -365,7 +375,7 @@ namespace Moljave.Http
             return stream;
         }
 
-        private static async Task<string> ReadHttpProxyResponseAsync(NetworkStream stream, CancellationToken cancellationToken)
+        private static async Task<string> ReadHttpProxyResponseAsync(Stream stream, CancellationToken cancellationToken)
         {
             var builder = new StringBuilder();
             var buffer = new byte[1];
@@ -389,6 +399,23 @@ namespace Moljave.Http
             }
 
             return builder.ToString();
+        }
+
+        private async Task<Stream> WrapProxyConnectionInTlsAsync(Stream stream, CancellationToken cancellationToken)
+        {
+            var sslStream = new SslStream(stream, leaveInnerStreamOpen: false, GetProxyValidationCallback());
+
+            try
+            {
+                var options = BuildAuthenticationOptions(_proxy.Host);
+                await sslStream.AuthenticateAsClientAsync(options, cancellationToken).ConfigureAwait(false);
+                return sslStream;
+            }
+            catch
+            {
+                sslStream.Dispose();
+                throw;
+            }
         }
 
         private async Task<Stream> EstablishSocks4TunnelAsync(NetworkStream stream, CancellationToken cancellationToken)
@@ -784,14 +811,14 @@ namespace Moljave.Http
             return Encoding.ASCII.GetString(buffer.ToArray()).TrimEnd('\r', '\n');
         }
 
-        private SslClientAuthenticationOptions BuildAuthenticationOptions()
+        private SslClientAuthenticationOptions BuildAuthenticationOptions(string targetHost)
         {
             var sslProtocols = _tlsSettings.EnabledProtocols ?? _fingerprint.GetSslProtocols();
             var applicationProtocols = _tlsSettings.ApplicationProtocols ?? _fingerprint.GetApplicationProtocols();
 
             var options = new SslClientAuthenticationOptions
             {
-                TargetHost = NormalizeHostname(_host) ?? _host,
+                TargetHost = NormalizeHostname(targetHost) ?? targetHost,
                 EnabledSslProtocols = sslProtocols,
                 EncryptionPolicy = EncryptionPolicy.RequireEncryption,
                 ClientCertificates = new X509CertificateCollection(),
@@ -823,6 +850,9 @@ namespace Moljave.Http
 
             return options;
         }
+
+        private RemoteCertificateValidationCallback GetProxyValidationCallback()
+            => _certificateValidationCallback ?? ((_, _, _, _) => true);
 
         private RemoteCertificateValidationCallback GetValidationCallback()
         {
