@@ -33,9 +33,9 @@ namespace Moljave.Http
         {
             var uriBuilder = new UriBuilder
             {
-                Scheme = Scheme == ProxyScheme.Https ? Uri.UriSchemeHttps : Uri.UriSchemeHttp,
+                Scheme = GetSchemeString(Scheme, ResolveHostnamesRemotely),
                 Host = Host,
-                Port = Port
+                Port = Port > 0 ? Port : GetDefaultPort(Scheme)
             };
 
             var proxy = new WebProxy(uriBuilder.Uri);
@@ -84,12 +84,19 @@ namespace Moljave.Http
             }
 
             var address = proxy.Address;
-            var scheme = address.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
-                ? ProxyScheme.Https
-                : ProxyScheme.Http;
+            if (string.IsNullOrWhiteSpace(address.Host))
+            {
+                return NoProxy;
+            }
+            var scheme = ParseScheme(address?.Scheme, out var resolveRemotely);
+            var port = address?.Port ?? -1;
+            if (port <= 0)
+            {
+                port = GetDefaultPort(scheme);
+            }
 
             var credentials = ExtractCredentials(proxy, address);
-            var descriptor = new ProxyDescriptor(scheme, address.Host, address.Port, credentials);
+            var descriptor = new ProxyDescriptor(scheme, address.Host, port, credentials, resolveRemotely);
             return new MojaveProxyOptions(descriptor);
         }
 
@@ -101,12 +108,19 @@ namespace Moljave.Http
             }
 
             var address = proxy.Address;
-            var scheme = address.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
-                ? ProxyScheme.Https
-                : ProxyScheme.Http;
+            if (string.IsNullOrWhiteSpace(address.Host))
+            {
+                return NoProxy;
+            }
+            var scheme = ParseScheme(address?.Scheme, out var resolveRemotely);
+            var port = address?.Port ?? -1;
+            if (port <= 0)
+            {
+                port = GetDefaultPort(scheme);
+            }
 
             var credentials = ExtractCredentials(proxy, address);
-            var descriptor = new ProxyDescriptor(scheme, address.Host, address.Port, credentials);
+            var descriptor = new ProxyDescriptor(scheme, address.Host, port, credentials, resolveRemotely);
             return new MojaveProxyOptions(descriptor, rotationListener);
         }
 
@@ -155,6 +169,59 @@ namespace Moljave.Http
             }
 
             return null;
+        }
+
+        private static ProxyScheme ParseScheme(string scheme, out bool resolveRemotely)
+        {
+            resolveRemotely = false;
+
+            if (string.IsNullOrWhiteSpace(scheme))
+            {
+                return ProxyScheme.Http;
+            }
+
+            switch (scheme.ToLowerInvariant())
+            {
+                case "https":
+                    return ProxyScheme.Https;
+                case "socks":
+                case "socks5":
+                    return ProxyScheme.Socks5;
+                case "socks5h":
+                    resolveRemotely = true;
+                    return ProxyScheme.Socks5;
+                case "socks4":
+                    return ProxyScheme.Socks4;
+                case "socks4a":
+                    resolveRemotely = true;
+                    return ProxyScheme.Socks4a;
+                default:
+                    return ProxyScheme.Http;
+            }
+        }
+
+        private static string GetSchemeString(ProxyScheme scheme, bool resolveRemotely)
+        {
+            return scheme switch
+            {
+                ProxyScheme.Https => Uri.UriSchemeHttps,
+                ProxyScheme.Socks4 when resolveRemotely => "socks4a",
+                ProxyScheme.Socks4 => "socks4",
+                ProxyScheme.Socks4a => "socks4a",
+                ProxyScheme.Socks5 when resolveRemotely => "socks5h",
+                ProxyScheme.Socks5 => "socks5",
+                _ => Uri.UriSchemeHttp
+            };
+        }
+
+        private static int GetDefaultPort(ProxyScheme scheme)
+        {
+            return scheme switch
+            {
+                ProxyScheme.Https => 443,
+                ProxyScheme.Socks4 or ProxyScheme.Socks4a or ProxyScheme.Socks5 => 1080,
+                _ => 80
+            };
         }
     }
 }

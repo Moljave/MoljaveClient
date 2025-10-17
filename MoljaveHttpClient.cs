@@ -10,8 +10,6 @@ namespace Moljave.Http
 {
     public sealed class MojaveHttpClient : IDisposable
     {
-        private static readonly Version s_defaultRequestVersion = HttpVersion.Version11;
-
         private readonly MojaveHttpClientOptions _options;
         private readonly HttpMessageInvoker _invoker;
         private readonly MojaveCookieManager _cookieManager;
@@ -19,6 +17,7 @@ namespace Moljave.Http
         private readonly object _proxyLock = new();
         private readonly HttpRequestMessage _defaultRequest = new();
         private readonly HttpRequestHeaders _defaultRequestHeaders;
+        private readonly Version _http11Version = HttpVersion.Version11;
 
         private Func<JA3Fingerprint> _fingerprintFactory;
         private JA3Fingerprint _currentFingerprint;
@@ -29,7 +28,7 @@ namespace Moljave.Http
         private bool _proxyEnabled = true;
 
         private Uri _baseAddress;
-        private Version _defaultRequestVersion = s_defaultRequestVersion;
+        private Version _defaultRequestVersion;
         private HttpVersionPolicy _defaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
         private long _maxResponseContentBufferSize = int.MaxValue;
         private bool _disposed;
@@ -73,6 +72,7 @@ namespace Moljave.Http
             _options.CookieManager = _cookieManager;
 
             _defaultRequestHeaders = _defaultRequest.Headers;
+            _defaultRequestVersion = _http11Version;
 
             InitializeFingerprint(_options.FingerprintProvider);
             _options.FingerprintProvider = ResolveFingerprint;
@@ -176,6 +176,21 @@ namespace Moljave.Http
         }
 
         public MojaveCookieManager CookieManager => _cookieManager;
+
+        public void SetCookie(Uri uri, Cookie cookie) => _cookieManager.SetCookie(uri, cookie);
+
+        public void SetCookie(
+            string domain,
+            string name,
+            string value,
+            string path = "/",
+            DateTime? expires = null,
+            bool? secure = null,
+            bool? httpOnly = null) =>
+            _cookieManager.SetCookie(domain, name, value, path, expires, secure, httpOnly);
+
+        public void RemoveCookie(string domain, string name, string path = "/") =>
+            _cookieManager.RemoveCookie(domain, name, path);
 
         public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
             => SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);
@@ -347,7 +362,7 @@ namespace Moljave.Http
         {
             lock (_fingerprintLock)
             {
-                _currentFingerprint = (_fingerprintFactory ?? DefaultFingerprintFactory)();
+                _currentFingerprint = (_fingerprintFactory ?? CreateDefaultFingerprint)();
             }
         }
 
@@ -507,7 +522,7 @@ namespace Moljave.Http
                 request.RequestUri = new Uri(baseAddress, request.RequestUri);
             }
 
-            if (request.Version == null || request.Version == s_defaultRequestVersion)
+            if (request.Version == null || IsDefaultHttp11(request.Version))
             {
                 request.Version = DefaultRequestVersion;
             }
@@ -661,7 +676,7 @@ namespace Moljave.Http
         {
             lock (_fingerprintLock)
             {
-                _fingerprintFactory = fingerprintProvider ?? DefaultFingerprintFactory;
+                _fingerprintFactory = fingerprintProvider ?? CreateDefaultFingerprint;
                 _currentFingerprint = _fingerprintFactory();
             }
         }
@@ -670,7 +685,7 @@ namespace Moljave.Http
         {
             lock (_fingerprintLock)
             {
-                _currentFingerprint ??= (_fingerprintFactory ?? DefaultFingerprintFactory)();
+                _currentFingerprint ??= (_fingerprintFactory ?? CreateDefaultFingerprint)();
                 return _currentFingerprint;
             }
         }
@@ -682,7 +697,27 @@ namespace Moljave.Http
             return options;
         }
 
-        private static JA3Fingerprint DefaultFingerprintFactory()
+        private bool IsDefaultHttp11(Version version)
+        {
+            if (version == null)
+            {
+                return true;
+            }
+
+            if (version.Major != 1 || version.Minor != 1)
+            {
+                return false;
+            }
+
+            var build = version.Build;
+            var revision = version.Revision;
+
+            bool IsUnset(int value) => value < 0;
+
+            return (IsUnset(build) || build == 0) && (IsUnset(revision) || revision == 0);
+        }
+
+        private JA3Fingerprint CreateDefaultFingerprint()
             => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome);
     }
 }
