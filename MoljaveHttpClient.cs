@@ -15,6 +15,10 @@ namespace Moljave.Http
         private readonly object _proxyLock = new();
         private Func<JA3Fingerprint> _fingerprintFactory;
         private JA3Fingerprint _currentFingerprint;
+        private Func<MojaveProxyOptions> _defaultProxyResolver;
+        private Func<MojaveProxyOptions> _overrideProxyResolver;
+        private MojaveProxyOptions _staticProxyOptions;
+        private bool _proxyEnabled = true;
         private bool _disposed;
 
         public MojaveHttpClient()
@@ -36,6 +40,10 @@ namespace Moljave.Http
                 }
             })
         {
+            if (proxy != null)
+            {
+                SetProxy(proxy);
+            }
         }
 
         public MojaveHttpClient(Action<MojaveHttpClientOptions> configure)
@@ -53,6 +61,9 @@ namespace Moljave.Http
 
             InitializeFingerprint(_options.FingerprintProvider);
             _options.FingerprintProvider = ResolveFingerprint;
+
+            InitializeProxy(_options.ProxyResolver);
+            _options.ProxyResolver = ResolveProxy;
 
             _invoker = new HttpMessageInvoker(_options.BuildHandlerPipeline(), disposeHandler: true);
         }
@@ -105,7 +116,86 @@ namespace Moljave.Http
             }
         }
 
-        public void UseProxy(MojaveProxyOptions proxyOptions)
+        public void SetProxy(WebProxy proxy)
+        {
+            lock (_proxyLock)
+            {
+                if (proxy == null)
+                {
+                    ClearConfiguredProxy();
+                    _proxyEnabled = false;
+                    return;
+                }
+
+                var options = MojaveProxyOptions.FromWebProxy(proxy);
+                if (!options.HasProxy)
+                {
+                    ClearConfiguredProxy();
+                    _overrideProxyResolver = null;
+                    _proxyEnabled = false;
+                    return;
+                }
+
+                _staticProxyOptions = options;
+                _overrideProxyResolver = null;
+                _proxyEnabled = true;
+            }
+        }
+
+        public void ChangeProxy(WebProxy proxy)
+        {
+            lock (_proxyLock)
+            {
+                if (proxy == null)
+                {
+                    ClearConfiguredProxy();
+                    return;
+                }
+
+                var options = MojaveProxyOptions.FromWebProxy(proxy);
+                if (!options.HasProxy)
+                {
+                    ClearConfiguredProxy();
+                    _overrideProxyResolver = null;
+                    _proxyEnabled = false;
+                    return;
+                }
+
+                _staticProxyOptions = options;
+                _overrideProxyResolver = null;
+            }
+        }
+
+        public void DisableProxy()
+        {
+            lock (_proxyLock)
+            {
+                _proxyEnabled = false;
+            }
+        }
+
+        public void EnableProxy()
+        {
+            lock (_proxyLock)
+            {
+                _proxyEnabled = true;
+            }
+        }
+
+        public void SetProxyResolver(Func<MojaveProxyOptions> resolver)
+        {
+            lock (_proxyLock)
+            {
+                _overrideProxyResolver = resolver;
+                ClearConfiguredProxy();
+                if (resolver != null)
+                {
+                    _proxyEnabled = true;
+                }
+            }
+        }
+
+        public void SetProxyOptions(MojaveProxyOptions proxyOptions)
         {
             if (proxyOptions == null)
             {
@@ -114,42 +204,18 @@ namespace Moljave.Http
 
             lock (_proxyLock)
             {
-                _options.ProxyResolver = () => proxyOptions;
+                ClearConfiguredProxy();
+                _overrideProxyResolver = null;
+                if (!proxyOptions.HasProxy)
+                {
+                    _proxyEnabled = false;
+                    return;
+                }
+
+                _staticProxyOptions = proxyOptions;
+                _proxyEnabled = true;
             }
         }
-
-        public void UseProxy(WebProxy proxy)
-        {
-            lock (_proxyLock)
-            {
-                _options.ProxyResolver = proxy != null
-                    ? () => MojaveProxyOptions.FromWebProxy(proxy)
-                    : () => MojaveProxyOptions.NoProxy;
-            }
-        }
-
-        public void UseProxyResolver(Func<MojaveProxyOptions> resolver)
-        {
-            lock (_proxyLock)
-            {
-                _options.ProxyResolver = resolver ?? (() => MojaveProxyOptions.NoProxy);
-            }
-        }
-
-        public void UseRotatingProxyProvider(RotatingProxyProvider provider)
-        {
-            if (provider == null)
-            {
-                throw new ArgumentNullException(nameof(provider));
-            }
-
-            lock (_proxyLock)
-            {
-                _options.ProxyResolver = () => provider.GetNextProxy();
-            }
-        }
-
-        public void ClearProxy() => UseProxy((WebProxy)null);
 
         public void ClearAllCookies() => _cookieManager.ClearAll();
 
@@ -192,6 +258,65 @@ namespace Moljave.Http
             });
 
             return _invoker.SendAsync(request, cancellationToken);
+        }
+
+        private void InitializeProxy(Func<MojaveProxyOptions> proxyResolver)
+        {
+            lock (_proxyLock)
+            {
+                _defaultProxyResolver = proxyResolver ?? (() => MojaveProxyOptions.NoProxy);
+                _overrideProxyResolver = null;
+                _staticProxyOptions = null;
+                _proxyEnabled = true;
+            }
+        }
+
+        private MojaveProxyOptions ResolveProxy()
+        {
+            lock (_proxyLock)
+            {
+                if (!_proxyEnabled)
+                {
+                    return MojaveProxyOptions.NoProxy;
+                }
+
+                if (_overrideProxyResolver != null)
+                {
+                    return InvokeResolver(_overrideProxyResolver);
+                }
+
+                if (_staticProxyOptions != null)
+                {
+                    return _staticProxyOptions;
+                }
+
+                return InvokeResolver(_defaultProxyResolver);
+            }
+        }
+
+        private static MojaveProxyOptions InvokeResolver(Func<MojaveProxyOptions> resolver)
+        {
+            if (resolver == null)
+            {
+                return MojaveProxyOptions.NoProxy;
+            }
+
+            try
+            {
+                return resolver() ?? MojaveProxyOptions.NoProxy;
+            }
+            catch (Exception ex)
+            {
+                throw new ProxyException(
+                    "The proxy resolver threw an exception.",
+                    ProxyErrorReason.Unsupported,
+                    innerException: ex);
+            }
+        }
+
+        private void ClearConfiguredProxy()
+        {
+            _staticProxyOptions = null;
         }
 
         private void InitializeFingerprint(Func<JA3Fingerprint> fingerprintProvider)

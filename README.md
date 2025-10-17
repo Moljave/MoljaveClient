@@ -73,7 +73,7 @@ class Program
         };
 
         // Optionally plug in a proxy at runtime
-        client.UseProxy(new WebProxy("socks5://127.0.0.1:9050"));
+        client.SetProxy(new WebProxy("socks5://127.0.0.1:9050"));
 
         var request = new HttpRequestMessage(HttpMethod.Get, "https://example.com/");
         request.AddHeaders(@"
@@ -151,15 +151,19 @@ client.ClearAllCookies();
 
 ```csharp
 // Use a direct proxy instance
-client.UseProxy(new WebProxy("http://127.0.0.1:8888"));
+client.SetProxy(new WebProxy("http://127.0.0.1:8888"));
 
-// Swap proxies on the fly
-client.UseProxyResolver(() => ProxyParser.TryParse(GetNextProxy(), out var proxy)
+// Swap proxies on the fly without re-enabling a disabled proxy
+client.ChangeProxy(new WebProxy("socks5://127.0.0.1:9050"));
+
+// Dynamically resolve proxies (e.g. rotating provider)
+client.SetProxyResolver(() => ProxyParser.TryParse(GetNextProxy(), out var proxy)
     ? proxy
     : MojaveProxyOptions.NoProxy);
 
-// Reset back to no proxy
-client.ClearProxy();
+// Temporarily stop using the configured proxy and enable it again later
+client.DisableProxy();
+client.EnableProxy();
 ```
 ## 🧪 Custom JA3 Example
 

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Security;
@@ -14,6 +15,8 @@ namespace Moljave.Http
 {
     public sealed class TlsClient : IDisposable
     {
+        private static readonly IdnMapping s_idnMapping = new();
+
         private readonly string _host;
         private readonly int _port;
         private readonly JA3Fingerprint _fingerprint;
@@ -146,7 +149,8 @@ namespace Moljave.Http
 
             if (_proxy == null)
             {
-                await _tcpClient.ConnectAsync(_host, _port).WaitAsync(cancellationToken).ConfigureAwait(false);
+                var targetHost = NormalizeHostname(_host);
+                await _tcpClient.ConnectAsync(targetHost, _port).WaitAsync(cancellationToken).ConfigureAwait(false);
                 _transportStream = _tcpClient.GetStream();
             }
             else
@@ -323,17 +327,24 @@ namespace Moljave.Http
 
         private async Task<Stream> EstablishHttpTunnelAsync(NetworkStream stream, CancellationToken cancellationToken)
         {
+            var authority = GetProxyAuthority();
             var builder = new StringBuilder();
-            builder.AppendLine($"CONNECT {_host}:{_port} HTTP/1.1");
-            builder.AppendLine($"Host: {_host}:{_port}");
+            builder.Append("CONNECT ").Append(authority).Append(" HTTP/1.1\r\n");
+            builder.Append("Host: ").Append(authority).Append("\r\n");
+            builder.Append("Proxy-Connection: Keep-Alive\r\n");
+            builder.Append("Connection: Keep-Alive\r\n");
+            builder.Append("Pragma: no-cache\r\n");
 
             if (_proxy.Credentials is NetworkCredential creds)
             {
-                var token = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{creds.UserName}:{creds.Password}"));
-                builder.AppendLine($"Proxy-Authorization: Basic {token}");
+                var authHeader = BuildProxyAuthorizationHeader(creds);
+                if (!string.IsNullOrEmpty(authHeader))
+                {
+                    builder.Append("Proxy-Authorization: ").Append(authHeader).Append("\r\n");
+                }
             }
 
-            builder.AppendLine();
+            builder.Append("\r\n");
 
             var requestBytes = Encoding.ASCII.GetBytes(builder.ToString());
             await stream.WriteAsync(requestBytes, 0, requestBytes.Length, cancellationToken).ConfigureAwait(false);
@@ -382,14 +393,19 @@ namespace Moljave.Http
 
         private async Task<Stream> EstablishSocks4TunnelAsync(NetworkStream stream, CancellationToken cancellationToken)
         {
-            var addressBytes = TryGetIpAddress(_host, out var ipAddress) && !_proxy.ResolveHostnamesRemotely
+            var normalizedHost = NormalizeHostname(_host);
+            var addressBytes = !_proxy.ResolveHostnamesRemotely && TryGetIpAddress(normalizedHost, out var ipAddress)
                 ? ipAddress.GetAddressBytes()
                 : new byte[] { 0x00, 0x00, 0x00, 0x01 };
 
             var userId = _proxy.Credentials?.UserName ?? string.Empty;
-            var hostBytes = Encoding.ASCII.GetBytes(_host);
+            var hostBytes = Encoding.ASCII.GetBytes(normalizedHost ?? string.Empty);
 
             bool useDomain = addressBytes[0] == 0x00 && addressBytes[1] == 0x00 && addressBytes[2] == 0x00 && addressBytes[3] == 0x01;
+            if (useDomain && hostBytes.Length > byte.MaxValue)
+            {
+                throw new ProxyException("SOCKS4 proxy hostname is too long.", ProxyErrorReason.Unsupported);
+            }
             var buffer = new byte[9 + userId.Length + (useDomain ? hostBytes.Length + 1 : 0)];
             int index = 0;
             buffer[index++] = 0x04;
@@ -475,6 +491,12 @@ namespace Moljave.Http
             {
                 throw new ProxyException("SOCKS5 proxy does not accept provided authentication methods.", ProxyErrorReason.AuthenticationFailed);
             }
+            else if (methodSelection[1] != 0x00)
+            {
+                throw new ProxyException(
+                    $"SOCKS5 proxy returned unsupported authentication method 0x{methodSelection[1]:X2}.",
+                    ProxyErrorReason.AuthenticationRequired);
+            }
 
             var (addressType, addressPayload) = BuildSocks5Address();
             var connectRequest = new byte[4 + addressPayload.Length + 2];
@@ -540,7 +562,7 @@ namespace Moljave.Http
                 statusCode = (HttpStatusCode)code;
             }
 
-            return code == 200;
+            return code >= 200 && code < 300;
         }
 
         private static string DescribeSocks4Status(byte status)
@@ -572,17 +594,24 @@ namespace Moljave.Http
 
         private (byte Type, byte[] Payload) BuildSocks5Address()
         {
-            if (!_proxy.ResolveHostnamesRemotely && TryGetIpAddress(_host, out var ipAddress))
+            var normalizedHost = NormalizeHostname(_host);
+
+            if (!_proxy.ResolveHostnamesRemotely && TryGetIpAddress(normalizedHost, out var ipAddress))
             {
                 var bytes = ipAddress.GetAddressBytes();
                 var type = ipAddress.AddressFamily == AddressFamily.InterNetwork ? (byte)0x01 : (byte)0x04;
                 return (type, bytes);
             }
 
-            var hostBytes = Encoding.ASCII.GetBytes(_host);
-            var payload = new byte[hostBytes.Length + 1];
-            payload[0] = (byte)hostBytes.Length;
-            Buffer.BlockCopy(hostBytes, 0, payload, 1, hostBytes.Length);
+            var asciiHost = Encoding.ASCII.GetBytes(normalizedHost ?? string.Empty);
+            if (asciiHost.Length > byte.MaxValue)
+            {
+                throw new ProxyException("SOCKS5 proxy hostname is too long.", ProxyErrorReason.Unsupported);
+            }
+
+            var payload = new byte[asciiHost.Length + 1];
+            payload[0] = (byte)asciiHost.Length;
+            Buffer.BlockCopy(asciiHost, 0, payload, 1, asciiHost.Length);
             return (0x03, payload);
         }
 
@@ -596,6 +625,69 @@ namespace Moljave.Http
         private static bool TryGetIpAddress(string host, out IPAddress address)
         {
             return IPAddress.TryParse(host, out address);
+        }
+
+        private string GetProxyAuthority()
+        {
+            var normalizedHost = NormalizeHostname(_host);
+            return FormatAuthority(normalizedHost, _port);
+        }
+
+        private static string NormalizeHostname(string host)
+        {
+            if (string.IsNullOrWhiteSpace(host))
+            {
+                return host;
+            }
+
+            if (IPAddress.TryParse(host, out _))
+            {
+                return host;
+            }
+
+            try
+            {
+                return s_idnMapping.GetAscii(host);
+            }
+            catch (ArgumentException)
+            {
+                return host;
+            }
+        }
+
+        private static string FormatAuthority(string host, int port)
+        {
+            if (string.IsNullOrEmpty(host))
+            {
+                return $":{port}";
+            }
+
+            return RequiresIpv6Brackets(host)
+                ? $"[{host}]:{port}"
+                : $"{host}:{port}";
+        }
+
+        private static bool RequiresIpv6Brackets(string host)
+            => host.IndexOf(':') >= 0 &&
+               !host.StartsWith("[", StringComparison.Ordinal) &&
+               !host.EndsWith("]", StringComparison.Ordinal);
+
+        private static string BuildProxyAuthorizationHeader(NetworkCredential credential)
+        {
+            if (credential == null)
+            {
+                return null;
+            }
+
+            var username = credential.UserName ?? string.Empty;
+            if (!string.IsNullOrEmpty(credential.Domain))
+            {
+                username = $"{credential.Domain}\\{username}";
+            }
+
+            var password = credential.Password ?? string.Empty;
+            var token = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{username}:{password}"));
+            return $"Basic {token}";
         }
 
         private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
@@ -699,7 +791,7 @@ namespace Moljave.Http
 
             var options = new SslClientAuthenticationOptions
             {
-                TargetHost = _host,
+                TargetHost = NormalizeHostname(_host) ?? _host,
                 EnabledSslProtocols = sslProtocols,
                 EncryptionPolicy = EncryptionPolicy.RequireEncryption,
                 ClientCertificates = new X509CertificateCollection(),

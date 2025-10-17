@@ -78,44 +78,83 @@ namespace Moljave.Http
 
         public static MojaveProxyOptions FromWebProxy(WebProxy proxy)
         {
-            if (proxy == null)
+            if (proxy?.Address == null)
             {
                 return NoProxy;
             }
 
-            var scheme = proxy.Address.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
+            var address = proxy.Address;
+            var scheme = address.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
                 ? ProxyScheme.Https
                 : ProxyScheme.Http;
 
-            NetworkCredential credentials = null;
-            if (proxy.Credentials is NetworkCredential creds)
-            {
-                credentials = new NetworkCredential(creds.UserName, creds.Password);
-            }
-
-            var descriptor = new ProxyDescriptor(scheme, proxy.Address.Host, proxy.Address.Port, credentials);
+            var credentials = ExtractCredentials(proxy, address);
+            var descriptor = new ProxyDescriptor(scheme, address.Host, address.Port, credentials);
             return new MojaveProxyOptions(descriptor);
         }
 
         internal static MojaveProxyOptions FromWebProxy(WebProxy proxy, IProxyRotationListener rotationListener)
         {
-            if (proxy == null)
+            if (proxy?.Address == null)
             {
                 return NoProxy;
             }
 
-            var scheme = proxy.Address.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
+            var address = proxy.Address;
+            var scheme = address.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
                 ? ProxyScheme.Https
                 : ProxyScheme.Http;
 
-            NetworkCredential credentials = null;
-            if (proxy.Credentials is NetworkCredential creds)
+            var credentials = ExtractCredentials(proxy, address);
+            var descriptor = new ProxyDescriptor(scheme, address.Host, address.Port, credentials);
+            return new MojaveProxyOptions(descriptor, rotationListener);
+        }
+
+        private static NetworkCredential ExtractCredentials(WebProxy proxy, Uri address)
+        {
+            if (proxy == null)
             {
-                credentials = new NetworkCredential(creds.UserName, creds.Password);
+                return null;
             }
 
-            var descriptor = new ProxyDescriptor(scheme, proxy.Address.Host, proxy.Address.Port, credentials);
-            return new MojaveProxyOptions(descriptor, rotationListener);
+            var credentials = proxy.Credentials;
+
+            NetworkCredential Clone(NetworkCredential source) => source == null
+                ? null
+                : new NetworkCredential(source.UserName, source.Password, source.Domain);
+
+            if (credentials is NetworkCredential direct)
+            {
+                return Clone(direct);
+            }
+
+            if (credentials != null && address != null)
+            {
+                static NetworkCredential TryGet(ICredentials provider, Uri uri, string authType)
+                    => provider?.GetCredential(uri, authType);
+
+                var resolved = TryGet(credentials, address, "Basic")
+                    ?? TryGet(credentials, address, "Digest")
+                    ?? TryGet(credentials, address, "NTLM")
+                    ?? TryGet(credentials, address, "Negotiate")
+                    ?? TryGet(credentials, address, null);
+
+                if (resolved != null)
+                {
+                    return Clone(resolved);
+                }
+            }
+
+            if (proxy.UseDefaultCredentials)
+            {
+                var defaults = CredentialCache.DefaultNetworkCredentials;
+                if (defaults != null)
+                {
+                    return Clone(defaults);
+                }
+            }
+
+            return null;
         }
     }
 }
