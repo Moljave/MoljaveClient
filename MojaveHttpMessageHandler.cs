@@ -179,6 +179,8 @@ namespace Moljave.Http
             for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
                 var proxyOptions = proxyContext?.GetProxyForAttempt(attempt) ?? MojaveProxyOptions.NoProxy;
+                var socketBufferSize = _options.SocketBufferSize;
+                var maxConnectionsPerHost = _options.MaxConnectionsPerHost;
                 TlsClientLease lease = null;
                 CancellationTokenSource waitCts = null;
                 CancellationTokenSource linkedCts = null;
@@ -202,8 +204,8 @@ namespace Moljave.Http
                         proxyOptions.Descriptor,
                         cookieManager,
                         _options.CertificateValidationCallback,
-                        _options.MaxConnectionsPerHost,
-                        _options.SocketBufferSize,
+                        maxConnectionsPerHost,
+                        socketBufferSize,
                         waitToken).ConfigureAwait(false);
 
                     linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -255,7 +257,9 @@ namespace Moljave.Http
                         fingerprint,
                         tlsSettings,
                         proxyOptions,
-                        cookieManager);
+                        cookieManager,
+                        socketBufferSize,
+                        maxConnectionsPerHost);
 
                     if (TlsPlatformSupport.TryDisableCipherSuitesPolicy(exceptionToHandle))
                     {
@@ -757,7 +761,9 @@ namespace Moljave.Http
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings,
             MojaveProxyOptions proxyOptions,
-            MojaveCookieManager cookieManager)
+            MojaveCookieManager cookieManager,
+            int socketBufferSize,
+            int maxConnectionsPerHost)
         {
             var socketException = FindSocketException(exception);
             if (socketException == null)
@@ -768,7 +774,7 @@ namespace Moljave.Http
             switch (socketException.SocketErrorCode)
             {
                 case SocketError.NoBufferSpaceAvailable:
-                    return CreateSocketResourceException(
+                    var noBufferSpaceException = CreateSocketResourceException(
                         socketException,
                         uri,
                         port,
@@ -778,9 +784,12 @@ namespace Moljave.Http
                         proxyOptions,
                         cookieManager,
                         "The operating system ran out of socket buffer space while communicating with ",
-                        "Reduce concurrent connections or lower MojaveHttpClientOptions.SocketBufferSize to avoid exhausting kernel buffers.");
+                        "Reduce concurrent connections or lower MojaveHttpClientOptions.SocketBufferSize to avoid exhausting kernel buffers.",
+                        socketBufferSize);
+                    _options.TryReduceSocketBufferSize(socketBufferSize);
+                    return noBufferSpaceException;
                 case SocketError.AddressAlreadyInUse:
-                    return CreateSocketResourceException(
+                    var addressInUseException = CreateSocketResourceException(
                         socketException,
                         uri,
                         port,
@@ -790,7 +799,10 @@ namespace Moljave.Http
                         proxyOptions,
                         cookieManager,
                         "The operating system refused to open a new socket because the local port range is exhausted while communicating with ",
-                        "Reduce concurrent connections or lower MojaveHttpClientOptions.MaxConnectionsPerHost to avoid running out of ephemeral ports.");
+                        "Reduce concurrent connections or lower MojaveHttpClientOptions.MaxConnectionsPerHost to avoid running out of ephemeral ports.",
+                        socketBufferSize);
+                    _options.TryReduceMaxConnectionsPerHost(maxConnectionsPerHost);
+                    return addressInUseException;
                 default:
                     return exception;
             }
@@ -806,7 +818,8 @@ namespace Moljave.Http
             MojaveProxyOptions proxyOptions,
             MojaveCookieManager cookieManager,
             string prefixMessage,
-            string mitigationMessage)
+            string mitigationMessage,
+            int socketBufferSize)
         {
             TlsConnectionPool.Shared.Clear(
                 uri?.Host,
@@ -816,7 +829,7 @@ namespace Moljave.Http
                 tlsSettings,
                 proxyOptions?.Descriptor,
                 cookieManager,
-                _options.SocketBufferSize);
+                socketBufferSize);
 
             var messageBuilder = new StringBuilder();
             messageBuilder.Append(prefixMessage);
