@@ -151,6 +151,12 @@ namespace Moljave.Http
             set => _options.MaxAutomaticRedirections = value;
         }
 
+        public bool ForceCloseConnectionsAfterRequest
+        {
+            get => _options.ForceCloseConnectionsAfterRequest;
+            set => _options.ForceCloseConnectionsAfterRequest = value;
+        }
+
         public int MaxConnectionRetries
         {
             get => _options.MaxConnectionRetries;

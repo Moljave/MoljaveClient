@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Security;
 using System.Runtime.CompilerServices;
@@ -113,6 +114,39 @@ namespace Moljave.Http
             if (_states.TryGetValue(key, out var state))
             {
                 state.ClearQueue();
+            }
+        }
+
+        public void ClearHostVariants(string host, int port, bool useTls)
+        {
+            if (string.IsNullOrEmpty(host))
+            {
+                return;
+            }
+
+            var keysToClear = new List<PoolKey>();
+
+            foreach (var kvp in _states)
+            {
+                var key = kvp.Key;
+                if (key.Port == port &&
+                    key.UseTls == useTls &&
+                    string.Equals(key.Host, host, StringComparison.OrdinalIgnoreCase))
+                {
+                    keysToClear.Add(key);
+                }
+            }
+
+            foreach (var key in keysToClear)
+            {
+                if (_states.TryRemove(key, out var state))
+                {
+                    state.ClearQueue();
+                }
+                else if (_states.TryGetValue(key, out var existing))
+                {
+                    existing.ClearQueue();
+                }
             }
         }
 

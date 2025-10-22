@@ -20,6 +20,7 @@ namespace Moljave.Http
         private long _connectionRetryDelayTicks = TimeSpan.FromMilliseconds(150).Ticks;
         private int _maxConnectionsPerHost = 256;
         private int _socketBufferSize = 8 * 1024;
+        private int _forceConnectionCloseAfterRequest = 0;
 
         public Func<JA3Fingerprint> FingerprintProvider { get; set; } =
             () => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome);
@@ -109,6 +110,12 @@ namespace Moljave.Http
             }
         }
 
+        public bool ForceCloseConnectionsAfterRequest
+        {
+            get => Volatile.Read(ref _forceConnectionCloseAfterRequest) == 1;
+            set => Interlocked.Exchange(ref _forceConnectionCloseAfterRequest, value ? 1 : 0);
+        }
+
         public IList<Func<DelegatingHandler>> DelegatingHandlerFactories { get; } = new List<Func<DelegatingHandler>>();
 
         public RemoteCertificateValidationCallback CertificateValidationCallback { get; set; }
@@ -184,6 +191,23 @@ namespace Moljave.Http
             }
         }
 
+        internal bool TryEnableForceCloseConnections()
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref _forceConnectionCloseAfterRequest);
+                if (current == 1)
+                {
+                    return false;
+                }
+
+                if (Interlocked.CompareExchange(ref _forceConnectionCloseAfterRequest, 1, current) == current)
+                {
+                    return true;
+                }
+            }
+        }
+
         internal HttpMessageHandler BuildHandlerPipeline()
         {
             HttpMessageHandler current = new MojaveHttpMessageHandler(this);
@@ -225,6 +249,7 @@ namespace Moljave.Http
         public MojaveCookieManager CookieManager { get; set; }
         public int? MaxConnectionRetries { get; set; }
         public TimeSpan? RetryDelay { get; set; }
+        public bool? ForceCloseConnectionsAfterRequest { get; set; }
 
         internal MojaveRequestOptions Clone() => new()
         {
@@ -236,7 +261,8 @@ namespace Moljave.Http
             MaxAutomaticRedirections = MaxAutomaticRedirections,
             CookieManager = CookieManager,
             MaxConnectionRetries = MaxConnectionRetries,
-            RetryDelay = RetryDelay
+            RetryDelay = RetryDelay,
+            ForceCloseConnectionsAfterRequest = ForceCloseConnectionsAfterRequest
         };
     }
 

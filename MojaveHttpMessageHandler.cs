@@ -54,9 +54,15 @@ namespace Moljave.Http
                 var tlsSettings = requestOptions?.TlsSettings ?? _options.TlsSettingsProvider?.Invoke() ?? MojaveTlsSettings.Default;
                 var maxRetries = Math.Max(0, requestOptions?.MaxConnectionRetries ?? _options.MaxConnectionRetries);
                 var retryDelay = requestOptions?.RetryDelay ?? _options.ConnectionRetryDelay;
+                var forceCloseConnections = (requestOptions?.ForceCloseConnectionsAfterRequest ?? false) || _options.ForceCloseConnectionsAfterRequest;
                 if (retryDelay < TimeSpan.Zero)
                 {
                     retryDelay = TimeSpan.Zero;
+                }
+
+                if (forceCloseConnections && currentRequest.Headers.ConnectionClose != true)
+                {
+                    currentRequest.Headers.ConnectionClose = true;
                 }
 
                 if (currentRequest.Content != null)
@@ -81,7 +87,7 @@ namespace Moljave.Http
 
                 HttpResponseMessage response = ShouldUseHttp2(currentRequest)
                     ? await SendHttp2Async(currentRequest, uri, effectiveTimeout, fingerprint, tlsSettings, proxyContext, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false)
-                    : await SendHttp11Async(currentRequest, uri, useTls, effectiveTimeout, fingerprint, tlsSettings, proxyContext, cookieManager, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false);
+                    : await SendHttp11Async(currentRequest, uri, useTls, effectiveTimeout, fingerprint, tlsSettings, proxyContext, cookieManager, maxRetries, retryDelay, forceCloseConnections, cancellationToken).ConfigureAwait(false);
 
                 if (cookieManager != null && response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
                 {
@@ -168,9 +174,9 @@ namespace Moljave.Http
             MojaveCookieManager cookieManager,
             int maxRetries,
             TimeSpan retryDelay,
+            bool forceCloseConnections,
             CancellationToken cancellationToken)
         {
-            var requestPayload = await HttpRequestStringifier.Stringify(request).ConfigureAwait(false);
             var requestWantsClose = RequestWantsConnectionClose(request);
             var targetPort = uri.IsDefaultPort ? (useTls ? 443 : 80) : uri.Port;
 
@@ -181,6 +187,7 @@ namespace Moljave.Http
                 var proxyOptions = proxyContext?.GetProxyForAttempt(attempt) ?? MojaveProxyOptions.NoProxy;
                 var socketBufferSize = _options.SocketBufferSize;
                 var maxConnectionsPerHost = _options.MaxConnectionsPerHost;
+                var affinityKey = GetConnectionAffinityKey(cookieManager, forceCloseConnections);
                 TlsClientLease lease = null;
                 CancellationTokenSource waitCts = null;
                 CancellationTokenSource linkedCts = null;
@@ -202,7 +209,7 @@ namespace Moljave.Http
                         fingerprint,
                         tlsSettings,
                         proxyOptions.Descriptor,
-                        cookieManager,
+                        affinityKey,
                         _options.CertificateValidationCallback,
                         maxConnectionsPerHost,
                         socketBufferSize,
@@ -214,6 +221,7 @@ namespace Moljave.Http
                         linkedCts.CancelAfter(timeout);
                     }
 
+                    var requestPayload = await HttpRequestStringifier.Stringify(request).ConfigureAwait(false);
                     var responseBytes = await lease.Client.SendRequestAsync(requestPayload, linkedCts.Token, useTls).ConfigureAwait(false);
                     var response = HttpResponseParser.Parse(responseBytes);
                     response.RequestMessage = request;
@@ -259,7 +267,15 @@ namespace Moljave.Http
                         proxyOptions,
                         cookieManager,
                         socketBufferSize,
-                        maxConnectionsPerHost);
+                        maxConnectionsPerHost,
+                        forceCloseConnections);
+
+                    forceCloseConnections = _options.ForceCloseConnectionsAfterRequest || forceCloseConnections;
+                    if (forceCloseConnections && request.Headers.ConnectionClose != true)
+                    {
+                        request.Headers.ConnectionClose = true;
+                        requestWantsClose = true;
+                    }
 
                     if (TlsPlatformSupport.TryDisableCipherSuitesPolicy(exceptionToHandle))
                     {
@@ -731,6 +747,16 @@ namespace Moljave.Http
             }
         }
 
+        private object GetConnectionAffinityKey(MojaveCookieManager cookieManager, bool forceCloseConnections)
+        {
+            if (forceCloseConnections)
+            {
+                return null;
+            }
+
+            return cookieManager;
+        }
+
         private static async Task DelayForRetryAsync(int attempt, TimeSpan baseDelay, CancellationToken cancellationToken)
         {
             if (baseDelay <= TimeSpan.Zero)
@@ -763,7 +789,8 @@ namespace Moljave.Http
             MojaveProxyOptions proxyOptions,
             MojaveCookieManager cookieManager,
             int socketBufferSize,
-            int maxConnectionsPerHost)
+            int maxConnectionsPerHost,
+            bool forceCloseConnections)
         {
             var socketException = FindSocketException(exception);
             if (socketException == null)
@@ -783,11 +810,21 @@ namespace Moljave.Http
                         tlsSettings,
                         proxyOptions,
                         cookieManager,
+                        forceCloseConnections,
                         "The operating system ran out of socket buffer space while communicating with ",
                         "Reduce concurrent connections or lower MojaveHttpClientOptions.SocketBufferSize to avoid exhausting kernel buffers.",
                         socketBufferSize);
                     var socketBufferReduced = _options.TryReduceSocketBufferSize(socketBufferSize);
                     var maxConnectionsReduced = _options.TryReduceMaxConnectionsPerHost(maxConnectionsPerHost);
+                    var forceCloseActivated = _options.TryEnableForceCloseConnections();
+                    if (forceCloseActivated)
+                    {
+                        forceCloseConnections = true;
+                        if (uri != null)
+                        {
+                            TlsConnectionPool.Shared.ClearHostVariants(uri.Host, port, useTls);
+                        }
+                    }
                     if (maxConnectionsReduced)
                     {
                         ReducePoolMaxConnections(
@@ -799,7 +836,8 @@ namespace Moljave.Http
                             proxyOptions,
                             cookieManager,
                             socketBufferSize,
-                            socketBufferReduced);
+                            socketBufferReduced,
+                            forceCloseConnections);
                     }
                     return noBufferSpaceException;
                 case SocketError.AddressAlreadyInUse:
@@ -812,9 +850,19 @@ namespace Moljave.Http
                         tlsSettings,
                         proxyOptions,
                         cookieManager,
+                        forceCloseConnections,
                         "The operating system refused to open a new socket because the local port range is exhausted while communicating with ",
                         "Reduce concurrent connections or lower MojaveHttpClientOptions.MaxConnectionsPerHost to avoid running out of ephemeral ports.",
                         socketBufferSize);
+                    var forceCloseEnabled = _options.TryEnableForceCloseConnections();
+                    if (forceCloseEnabled)
+                    {
+                        forceCloseConnections = true;
+                        if (uri != null)
+                        {
+                            TlsConnectionPool.Shared.ClearHostVariants(uri.Host, port, useTls);
+                        }
+                    }
                     if (_options.TryReduceMaxConnectionsPerHost(maxConnectionsPerHost))
                     {
                         ReducePoolMaxConnections(
@@ -826,7 +874,8 @@ namespace Moljave.Http
                             proxyOptions,
                             cookieManager,
                             socketBufferSize,
-                            socketBufferReduced: false);
+                            socketBufferReduced: false,
+                            forceCloseConnections);
                     }
                     return addressInUseException;
                 default:
@@ -843,6 +892,7 @@ namespace Moljave.Http
             MojaveTlsSettings tlsSettings,
             MojaveProxyOptions proxyOptions,
             MojaveCookieManager cookieManager,
+            bool forceCloseConnections,
             string prefixMessage,
             string mitigationMessage,
             int socketBufferSize)
@@ -854,7 +904,7 @@ namespace Moljave.Http
                 fingerprint,
                 tlsSettings,
                 proxyOptions?.Descriptor,
-                cookieManager,
+                GetConnectionAffinityKey(cookieManager, forceCloseConnections),
                 socketBufferSize);
 
             var messageBuilder = new StringBuilder();
@@ -876,7 +926,8 @@ namespace Moljave.Http
             MojaveProxyOptions proxyOptions,
             MojaveCookieManager cookieManager,
             int observedSocketBufferSize,
-            bool socketBufferReduced)
+            bool socketBufferReduced,
+            bool forceCloseConnections)
         {
             if (uri == null)
             {
@@ -884,7 +935,7 @@ namespace Moljave.Http
             }
 
             var descriptor = proxyOptions?.Descriptor;
-            var affinityKey = (object)cookieManager;
+            var affinityKey = GetConnectionAffinityKey(cookieManager, forceCloseConnections);
             var maxConnections = _options.MaxConnectionsPerHost;
 
             TlsConnectionPool.Shared.AdjustMaxConnections(
