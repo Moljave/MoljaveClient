@@ -247,7 +247,7 @@ namespace Moljave.Http
                 {
                     lease?.MarkUnusable();
 
-                    var exceptionToHandle = AugmentSocketBufferSpaceException(
+                    var exceptionToHandle = AugmentSocketResourceException(
                         ex,
                         uri,
                         targetPort,
@@ -749,7 +749,7 @@ namespace Moljave.Http
             return TimeSpan.FromMilliseconds(cappedMilliseconds);
         }
 
-        private Exception AugmentSocketBufferSpaceException(
+        private Exception AugmentSocketResourceException(
             Exception exception,
             Uri uri,
             int port,
@@ -760,11 +760,54 @@ namespace Moljave.Http
             MojaveCookieManager cookieManager)
         {
             var socketException = FindSocketException(exception);
-            if (socketException == null || socketException.SocketErrorCode != SocketError.NoBufferSpaceAvailable)
+            if (socketException == null)
             {
                 return exception;
             }
 
+            switch (socketException.SocketErrorCode)
+            {
+                case SocketError.NoBufferSpaceAvailable:
+                    return CreateSocketResourceException(
+                        socketException,
+                        uri,
+                        port,
+                        useTls,
+                        fingerprint,
+                        tlsSettings,
+                        proxyOptions,
+                        cookieManager,
+                        "The operating system ran out of socket buffer space while communicating with ",
+                        "Reduce concurrent connections or lower MojaveHttpClientOptions.SocketBufferSize to avoid exhausting kernel buffers.");
+                case SocketError.AddressAlreadyInUse:
+                    return CreateSocketResourceException(
+                        socketException,
+                        uri,
+                        port,
+                        useTls,
+                        fingerprint,
+                        tlsSettings,
+                        proxyOptions,
+                        cookieManager,
+                        "The operating system refused to open a new socket because the local port range is exhausted while communicating with ",
+                        "Reduce concurrent connections or lower MojaveHttpClientOptions.MaxConnectionsPerHost to avoid running out of ephemeral ports.");
+                default:
+                    return exception;
+            }
+        }
+
+        private HttpRequestException CreateSocketResourceException(
+            SocketException socketException,
+            Uri uri,
+            int port,
+            bool useTls,
+            JA3Fingerprint fingerprint,
+            MojaveTlsSettings tlsSettings,
+            MojaveProxyOptions proxyOptions,
+            MojaveCookieManager cookieManager,
+            string prefixMessage,
+            string mitigationMessage)
+        {
             TlsConnectionPool.Shared.Clear(
                 uri?.Host,
                 port,
@@ -776,12 +819,11 @@ namespace Moljave.Http
                 _options.SocketBufferSize);
 
             var messageBuilder = new StringBuilder();
-            messageBuilder.Append("The operating system ran out of socket buffer space while communicating with ");
+            messageBuilder.Append(prefixMessage);
             messageBuilder.Append(uri?.Host ?? "the remote host");
             messageBuilder.Append('.');
-
             messageBuilder.Append(' ');
-            messageBuilder.Append("Reduce concurrent connections or lower MojaveHttpClientOptions.SocketBufferSize to avoid exhausting kernel buffers.");
+            messageBuilder.Append(mitigationMessage);
 
             return new HttpRequestException(messageBuilder.ToString(), socketException);
         }
