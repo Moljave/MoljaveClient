@@ -24,6 +24,7 @@ namespace Moljave.Http
         private readonly ProxyDescriptor _proxy;
         private readonly MojaveTlsSettings _tlsSettings;
         private readonly RemoteCertificateValidationCallback _certificateValidationCallback;
+        private readonly int _socketBufferSize;
 
         private TcpClient _tcpClient;
         private Stream _transportStream;
@@ -36,7 +37,8 @@ namespace Moljave.Http
             JA3Fingerprint fingerprint,
             ProxyDescriptor proxy,
             MojaveTlsSettings tlsSettings,
-            RemoteCertificateValidationCallback certificateValidationCallback)
+            RemoteCertificateValidationCallback certificateValidationCallback,
+            int socketBufferSize)
         {
             _host = host ?? throw new ArgumentNullException(nameof(host));
             _port = port;
@@ -44,6 +46,7 @@ namespace Moljave.Http
             _proxy = proxy;
             _tlsSettings = tlsSettings ?? MojaveTlsSettings.Default;
             _certificateValidationCallback = certificateValidationCallback ?? ((_, _, _, _) => true);
+            _socketBufferSize = socketBufferSize <= 0 ? 0 : Math.Max(socketBufferSize, 4096);
         }
 
         public async Task<byte[]> SendRequestAsync(byte[] requestBytes, CancellationToken cancellationToken, bool useTls)
@@ -120,11 +123,11 @@ namespace Moljave.Http
             _tcpClient = new TcpClient
             {
                 NoDelay = true,
-                ReceiveBufferSize = 64 * 1024,
-                SendBufferSize = 64 * 1024,
                 // Use an abortive close so sockets do not pile up in TIME_WAIT when running at high volume.
                 LingerState = new LingerOption(enable: true, seconds: 0)
             };
+
+            TryConfigureSocketBuffers(_tcpClient, _socketBufferSize);
 
             ConfigureForHighVolumeReuse(_tcpClient);
 
@@ -254,6 +257,57 @@ namespace Moljave.Http
             {
             }
             catch (NotSupportedException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        private static void TryConfigureSocketBuffers(TcpClient client, int size)
+        {
+            if (client == null || size <= 0)
+            {
+                return;
+            }
+
+            try
+            {
+                client.ReceiveBufferSize = size;
+                client.SendBufferSize = size;
+            }
+            catch (SocketException)
+            {
+                // Ignore failures when the platform does not allow overriding buffer sizes.
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+
+            var socket = client.Client;
+            if (socket == null)
+            {
+                return;
+            }
+
+            try
+            {
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, size);
+            }
+            catch (SocketException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+
+            try
+            {
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, size);
+            }
+            catch (SocketException)
             {
             }
             catch (ObjectDisposedException)

@@ -30,6 +30,7 @@ namespace Moljave.Http
             object affinityKey,
             RemoteCertificateValidationCallback certificateValidationCallback,
             int maxConnections,
+            int socketBufferSize,
             CancellationToken cancellationToken)
         {
             if (string.IsNullOrEmpty(host))
@@ -50,7 +51,8 @@ namespace Moljave.Http
                 BuildFingerprintSignature(fingerprint),
                 BuildTlsSignature(tlsSettings),
                 BuildProxySignature(proxyDescriptor),
-                affinityHash);
+                affinityHash,
+                socketBufferSize);
 
             var state = _states.GetOrAdd(key, _ => new PoolState());
             var semaphore = state.GetSemaphore(maxConnections);
@@ -75,7 +77,8 @@ namespace Moljave.Http
                     fingerprint,
                     proxyDescriptor,
                     tlsSettings,
-                    certificateValidationCallback);
+                    certificateValidationCallback,
+                    socketBufferSize);
 
                 return new TlsClientLease(this, key, state, semaphore, client);
             }
@@ -170,7 +173,7 @@ namespace Moljave.Http
 
         internal readonly struct PoolKey : IEquatable<PoolKey>
         {
-            public PoolKey(string host, int port, bool useTls, string fingerprintSignature, string tlsSignature, string proxySignature, int affinityHash)
+            public PoolKey(string host, int port, bool useTls, string fingerprintSignature, string tlsSignature, string proxySignature, int affinityHash, int socketBufferSize)
             {
                 Host = host;
                 Port = port;
@@ -179,6 +182,7 @@ namespace Moljave.Http
                 TlsSignature = tlsSignature;
                 ProxySignature = proxySignature;
                 AffinityHash = affinityHash;
+                SocketBufferSize = socketBufferSize;
             }
 
             public string Host { get; }
@@ -188,6 +192,7 @@ namespace Moljave.Http
             public string TlsSignature { get; }
             public string ProxySignature { get; }
             public int AffinityHash { get; }
+            public int SocketBufferSize { get; }
 
             public bool Equals(PoolKey other)
             {
@@ -197,7 +202,8 @@ namespace Moljave.Http
                     string.Equals(FingerprintSignature, other.FingerprintSignature, StringComparison.Ordinal) &&
                     string.Equals(TlsSignature, other.TlsSignature, StringComparison.Ordinal) &&
                     string.Equals(ProxySignature, other.ProxySignature, StringComparison.Ordinal) &&
-                    AffinityHash == other.AffinityHash;
+                    AffinityHash == other.AffinityHash &&
+                    SocketBufferSize == other.SocketBufferSize;
             }
 
             public override bool Equals(object obj)
@@ -215,6 +221,7 @@ namespace Moljave.Http
                 hash.Add(TlsSignature, StringComparer.Ordinal);
                 hash.Add(ProxySignature, StringComparer.Ordinal);
                 hash.Add(AffinityHash);
+                hash.Add(SocketBufferSize);
                 return hash.ToHashCode();
             }
         }

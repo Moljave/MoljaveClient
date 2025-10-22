@@ -16,6 +16,7 @@ namespace Moljave.Http
         private int _maxConnectionRetries = 2;
         private long _connectionRetryDelayTicks = TimeSpan.FromMilliseconds(150).Ticks;
         private int _maxConnectionsPerHost = 15000;
+        private int _socketBufferSize = 16 * 1024;
 
         public Func<JA3Fingerprint> FingerprintProvider { get; set; } =
             () => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome);
@@ -92,6 +93,16 @@ namespace Moljave.Http
             {
                 var effective = value <= 0 ? 1 : value;
                 Interlocked.Exchange(ref _maxConnectionsPerHost, effective);
+            }
+        }
+
+        public int SocketBufferSize
+        {
+            get => Volatile.Read(ref _socketBufferSize);
+            set
+            {
+                var effective = value < 0 ? 0 : value;
+                Interlocked.Exchange(ref _socketBufferSize, effective);
             }
         }
 

@@ -203,6 +203,7 @@ namespace Moljave.Http
                         cookieManager,
                         _options.CertificateValidationCallback,
                         _options.MaxConnectionsPerHost,
+                        _options.SocketBufferSize,
                         waitToken).ConfigureAwait(false);
 
                     linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -499,7 +500,8 @@ namespace Moljave.Http
                                 fingerprint,
                                 proxyOptions.Descriptor,
                                 tlsSettings,
-                                _options.CertificateValidationCallback);
+                                _options.CertificateValidationCallback,
+                                _options.SocketBufferSize);
 
                             var stream = await connector.CreateTransportStreamAsync(token).ConfigureAwait(false);
                             return new TlsClientTransportStream(connector, stream);
