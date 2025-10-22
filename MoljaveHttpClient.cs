@@ -262,12 +262,31 @@ namespace Moljave.Http
         public async Task<byte[]> GetByteArrayAsync(string requestUri, CancellationToken cancellationToken)
             => await GetByteArrayAsync(CreateUri(requestUri), cancellationToken).ConfigureAwait(false);
 
+        public async Task<byte[]> GetByteArrayAsync(string requestUri, bool bypassProxy, CancellationToken cancellationToken = default)
+            => await GetByteArrayAsync(CreateUri(requestUri), bypassProxy, cancellationToken).ConfigureAwait(false);
+
         public async Task<byte[]> GetByteArrayAsync(Uri requestUri)
             => await GetByteArrayAsync(requestUri, CancellationToken.None).ConfigureAwait(false);
 
         public async Task<byte[]> GetByteArrayAsync(Uri requestUri, CancellationToken cancellationToken)
         {
             using var response = await GetAsync(requestUri, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            return await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        }
+
+        public async Task<byte[]> GetByteArrayAsync(Uri requestUri, bool bypassProxy, CancellationToken cancellationToken = default)
+        {
+            using var request = CreateRequestMessage(HttpMethod.Get, requestUri);
+            if (bypassProxy)
+            {
+                request.ConfigureMojaveOptions(options =>
+                {
+                    options.Proxy = MojaveProxyOptions.NoProxy;
+                });
+            }
+
+            using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
         }
@@ -429,6 +448,27 @@ namespace Moljave.Http
             {
                 _proxyEnabled = true;
             }
+        }
+
+        public Task<HttpResponseMessage> SendWithoutProxyAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
+            => SendWithoutProxyAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);
+
+        public Task<HttpResponseMessage> SendWithoutProxyAsync(
+            HttpRequestMessage request,
+            HttpCompletionOption completionOption,
+            CancellationToken cancellationToken = default)
+        {
+            if (request == null)
+            {
+                throw new ArgumentNullException(nameof(request));
+            }
+
+            request.ConfigureMojaveOptions(options =>
+            {
+                options.Proxy = MojaveProxyOptions.NoProxy;
+            });
+
+            return SendAsync(request, completionOption, cancellationToken);
         }
 
         public void SetProxyResolver(Func<MojaveProxyOptions> resolver)
