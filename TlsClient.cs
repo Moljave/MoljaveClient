@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -63,32 +64,10 @@ namespace Moljave.Http
             await activeStream.FlushAsync(cancellationToken).ConfigureAwait(false);
 
             using var memoryStream = new MemoryStream();
-            var headerBuffer = new List<byte>();
-            var buffer = new byte[1];
+            var headerResult = await ReadHeadersAsync(activeStream, cancellationToken).ConfigureAwait(false);
+            memoryStream.Write(headerResult.HeaderBuffer, 0, headerResult.HeaderLength);
 
-            while (true)
-            {
-                var read = await activeStream.ReadAsync(buffer, 0, 1, cancellationToken).ConfigureAwait(false);
-                if (read == 0)
-                {
-                    throw new IOException("Unexpected end of stream while reading headers.");
-                }
-
-                headerBuffer.Add(buffer[0]);
-                if (headerBuffer.Count >= 4 &&
-                    headerBuffer[^4] == 13 &&
-                    headerBuffer[^3] == 10 &&
-                    headerBuffer[^2] == 13 &&
-                    headerBuffer[^1] == 10)
-                {
-                    break;
-                }
-            }
-
-            var headerBytes = headerBuffer.ToArray();
-            memoryStream.Write(headerBytes, 0, headerBytes.Length);
-
-            var headersText = Encoding.ASCII.GetString(headerBytes);
+            var headersText = Encoding.ASCII.GetString(headerResult.HeaderBuffer, 0, headerResult.HeaderLength);
             int contentLength = 0;
             bool hasContentLength = false;
             bool isChunked = false;
@@ -108,17 +87,19 @@ namespace Moljave.Http
                 }
             }
 
+            using var responseStream = new BufferedReadStream(activeStream, headerResult.PrefetchBuffer, headerResult.PrefetchLength);
+
             if (isChunked)
             {
-                await ReadChunkedBodyAsync(activeStream, memoryStream, cancellationToken).ConfigureAwait(false);
+                await ReadChunkedBodyAsync(responseStream, memoryStream, cancellationToken).ConfigureAwait(false);
             }
             else if (hasContentLength)
             {
-                await ReadFixedBodyAsync(activeStream, memoryStream, contentLength, cancellationToken).ConfigureAwait(false);
+                await ReadFixedBodyAsync(responseStream, memoryStream, contentLength, cancellationToken).ConfigureAwait(false);
             }
             else
             {
-                await ReadUntilEndAsync(activeStream, memoryStream, cancellationToken).ConfigureAwait(false);
+                await ReadUntilEndAsync(responseStream, memoryStream, cancellationToken).ConfigureAwait(false);
             }
 
             return memoryStream.ToArray();
@@ -361,7 +342,7 @@ namespace Moljave.Http
             await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
 
             var response = await ReadHttpProxyResponseAsync(stream, cancellationToken).ConfigureAwait(false);
-            if (!IsSuccessfulHttpProxyResponse(response, out var statusCode, out var statusLine))
+            if (!IsSuccessfulHttpProxyResponse(response.Text, out var statusCode, out var statusLine))
             {
                 var reason = statusCode == HttpStatusCode.ProxyAuthenticationRequired
                     ? ProxyErrorReason.AuthenticationRequired
@@ -372,33 +353,19 @@ namespace Moljave.Http
                 throw new ProxyException(message, reason, statusCode);
             }
 
-            return stream;
-        }
-
-        private static async Task<string> ReadHttpProxyResponseAsync(Stream stream, CancellationToken cancellationToken)
-        {
-            var builder = new StringBuilder();
-            var buffer = new byte[1];
-            while (true)
+            if (response.PrefetchLength <= 0)
             {
-                var read = await stream.ReadAsync(buffer, 0, 1, cancellationToken).ConfigureAwait(false);
-                if (read == 0)
-                {
-                    break;
-                }
-
-                builder.Append((char)buffer[0]);
-                if (builder.Length >= 4 &&
-                    builder[^4] == '\r' &&
-                    builder[^3] == '\n' &&
-                    builder[^2] == '\r' &&
-                    builder[^1] == '\n')
-                {
-                    break;
-                }
+                return stream;
             }
 
-            return builder.ToString();
+            return new PrefixedStream(stream, response.PrefetchBuffer, response.PrefetchLength);
+        }
+
+        private static async Task<ProxyResponseBuffer> ReadHttpProxyResponseAsync(Stream stream, CancellationToken cancellationToken)
+        {
+            var headerResult = await ReadHeadersAsync(stream, cancellationToken).ConfigureAwait(false);
+            var text = Encoding.ASCII.GetString(headerResult.HeaderBuffer, 0, headerResult.HeaderLength);
+            return new ProxyResponseBuffer(text, headerResult.PrefetchBuffer, headerResult.PrefetchLength);
         }
 
         private async Task<Stream> WrapProxyConnectionInTlsAsync(Stream stream, CancellationToken cancellationToken)
@@ -809,6 +776,344 @@ namespace Moljave.Http
             }
 
             return Encoding.ASCII.GetString(buffer.ToArray()).TrimEnd('\r', '\n');
+        }
+
+        private static async Task<HeaderReadResult> ReadHeadersAsync(Stream stream, CancellationToken cancellationToken)
+        {
+            var writer = new ArrayBufferWriter<byte>(4096);
+            var buffer = ArrayPool<byte>.Shared.Rent(8192);
+
+            try
+            {
+                while (true)
+                {
+                    var read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        throw new IOException("Unexpected end of stream while reading headers.");
+                    }
+
+                    var previousLength = writer.WrittenCount;
+                    writer.Write(buffer.AsSpan(0, read));
+                    var span = writer.WrittenSpan;
+                    var searchStart = previousLength >= 3 ? previousLength : 3;
+
+                    for (int i = searchStart; i < span.Length; i++)
+                    {
+                        if (span[i - 3] == 13 && span[i - 2] == 10 && span[i - 1] == 13 && span[i] == 10)
+                        {
+                            var headerLength = i + 1;
+                            var headerBuffer = new byte[headerLength];
+                            span.Slice(0, headerLength).CopyTo(headerBuffer);
+
+                            var leftoverCount = span.Length - headerLength;
+                            byte[] prefetch = Array.Empty<byte>();
+                            if (leftoverCount > 0)
+                            {
+                                prefetch = new byte[leftoverCount];
+                                span.Slice(headerLength, leftoverCount).CopyTo(prefetch);
+                            }
+
+                            return new HeaderReadResult(headerBuffer, headerLength, prefetch, leftoverCount);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        private readonly struct HeaderReadResult
+        {
+            public HeaderReadResult(byte[] headerBuffer, int headerLength, byte[] prefetchBuffer, int prefetchLength)
+            {
+                HeaderBuffer = headerBuffer;
+                HeaderLength = headerLength;
+                PrefetchBuffer = prefetchBuffer;
+                PrefetchLength = prefetchLength;
+            }
+
+            public byte[] HeaderBuffer { get; }
+            public int HeaderLength { get; }
+            public byte[] PrefetchBuffer { get; }
+            public int PrefetchLength { get; }
+        }
+
+        private readonly struct ProxyResponseBuffer
+        {
+            public ProxyResponseBuffer(string text, byte[] prefetchBuffer, int prefetchLength)
+            {
+                Text = text;
+                PrefetchBuffer = prefetchBuffer;
+                PrefetchLength = prefetchLength;
+            }
+
+            public string Text { get; }
+            public byte[] PrefetchBuffer { get; }
+            public int PrefetchLength { get; }
+        }
+
+        private sealed class PrefixedStream : Stream
+        {
+            private readonly Stream _inner;
+            private readonly byte[] _prefix;
+            private readonly int _prefixLength;
+            private int _offset;
+
+            public PrefixedStream(Stream inner, byte[] prefix, int prefixLength)
+            {
+                _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+                _prefix = prefix ?? Array.Empty<byte>();
+                _prefixLength = Math.Min(prefixLength, _prefix.Length);
+                _offset = 0;
+            }
+
+            public override bool CanRead => _inner.CanRead;
+            public override bool CanSeek => false;
+            public override bool CanWrite => _inner.CanWrite;
+            public override long Length => throw new NotSupportedException();
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override void Flush() => _inner.Flush();
+
+            public override Task FlushAsync(CancellationToken cancellationToken) => _inner.FlushAsync(cancellationToken);
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                ValidateBuffer(buffer, offset, count);
+
+                if (_offset < _prefixLength)
+                {
+                    var available = Math.Min(count, _prefixLength - _offset);
+                    Buffer.BlockCopy(_prefix, _offset, buffer, offset, available);
+                    _offset += available;
+                    return available;
+                }
+
+                return _inner.Read(buffer, offset, count);
+            }
+
+            public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+            {
+                if (_offset < _prefixLength)
+                {
+                    var available = Math.Min(buffer.Length, _prefixLength - _offset);
+                    new ReadOnlyMemory<byte>(_prefix, _offset, available).CopyTo(buffer);
+                    _offset += available;
+                    return ValueTask.FromResult(available);
+                }
+
+                return _inner.ReadAsync(buffer, cancellationToken);
+            }
+
+            public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+                => ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+            public override void SetLength(long value) => throw new NotSupportedException();
+
+            public override void Write(byte[] buffer, int offset, int count) => _inner.Write(buffer, offset, count);
+
+            public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+                => _inner.WriteAsync(buffer, offset, count, cancellationToken);
+
+            public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+                => _inner.WriteAsync(buffer, cancellationToken);
+
+            protected override void Dispose(bool disposing)
+            {
+                // The underlying stream is owned by TlsClient.
+            }
+
+            private static void ValidateBuffer(byte[] buffer, int offset, int count)
+            {
+                if (buffer == null)
+                {
+                    throw new ArgumentNullException(nameof(buffer));
+                }
+
+                if (offset < 0 || count < 0 || buffer.Length - offset < count)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(offset));
+                }
+            }
+        }
+
+        private sealed class BufferedReadStream : Stream
+        {
+            private readonly Stream _inner;
+            private readonly byte[] _buffer;
+            private int _bufferOffset;
+            private int _bufferLength;
+            private byte[] _prefetch;
+            private int _prefetchOffset;
+            private readonly int _prefetchLength;
+            private bool _disposed;
+
+            public BufferedReadStream(Stream inner, byte[] prefetch, int prefetchLength, int bufferSize = 16384)
+            {
+                _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+                _prefetch = prefetch ?? Array.Empty<byte>();
+                _prefetchLength = Math.Min(prefetchLength, _prefetch.Length);
+                _buffer = ArrayPool<byte>.Shared.Rent(bufferSize <= 0 ? 16384 : bufferSize);
+                _bufferOffset = 0;
+                _bufferLength = 0;
+            }
+
+            public override bool CanRead => _inner.CanRead;
+            public override bool CanSeek => false;
+            public override bool CanWrite => _inner.CanWrite;
+            public override long Length => throw new NotSupportedException();
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override void Flush() => _inner.Flush();
+
+            public override Task FlushAsync(CancellationToken cancellationToken) => _inner.FlushAsync(cancellationToken);
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                ValidateBuffer(buffer, offset, count);
+
+                if (count == 0)
+                {
+                    return 0;
+                }
+
+                var copied = ReadFromPrefetch(buffer.AsSpan(offset, count));
+                if (copied > 0)
+                {
+                    return copied;
+                }
+
+                if (_bufferOffset < _bufferLength)
+                {
+                    var available = Math.Min(count, _bufferLength - _bufferOffset);
+                    Buffer.BlockCopy(_buffer, _bufferOffset, buffer, offset, available);
+                    _bufferOffset += available;
+                    return available;
+                }
+
+                var read = _inner.Read(_buffer, 0, _buffer.Length);
+                _bufferOffset = 0;
+                _bufferLength = read;
+
+                if (read <= 0)
+                {
+                    return 0;
+                }
+
+                var toCopy = Math.Min(count, read);
+                Buffer.BlockCopy(_buffer, 0, buffer, offset, toCopy);
+                _bufferOffset += toCopy;
+                return toCopy;
+            }
+
+            public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+            {
+                if (buffer.Length == 0)
+                {
+                    return 0;
+                }
+
+                var copied = ReadFromPrefetch(buffer.Span);
+                if (copied > 0)
+                {
+                    return copied;
+                }
+
+                if (_bufferOffset < _bufferLength)
+                {
+                    var available = Math.Min(buffer.Length, _bufferLength - _bufferOffset);
+                    _buffer.AsSpan(_bufferOffset, available).CopyTo(buffer.Span);
+                    _bufferOffset += available;
+                    return available;
+                }
+
+                var read = await _inner.ReadAsync(_buffer.AsMemory(0, _buffer.Length), cancellationToken).ConfigureAwait(false);
+                _bufferOffset = 0;
+                _bufferLength = read;
+
+                if (read <= 0)
+                {
+                    return 0;
+                }
+
+                var toCopy = Math.Min(buffer.Length, read);
+                _buffer.AsSpan(0, toCopy).CopyTo(buffer.Span);
+                _bufferOffset += toCopy;
+                return toCopy;
+            }
+
+            public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            {
+                ValidateBuffer(buffer, offset, count);
+                return ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+            }
+
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+            public override void SetLength(long value) => throw new NotSupportedException();
+
+            public override void Write(byte[] buffer, int offset, int count) => _inner.Write(buffer, offset, count);
+
+            public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+                => _inner.WriteAsync(buffer, offset, count, cancellationToken);
+
+            public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+                => _inner.WriteAsync(buffer, cancellationToken);
+
+            protected override void Dispose(bool disposing)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
+                ArrayPool<byte>.Shared.Return(_buffer);
+            }
+
+            private int ReadFromPrefetch(Span<byte> destination)
+            {
+                if (_prefetchOffset >= _prefetchLength)
+                {
+                    return 0;
+                }
+
+                var available = Math.Min(destination.Length, _prefetchLength - _prefetchOffset);
+                _prefetch.AsSpan(_prefetchOffset, available).CopyTo(destination);
+                _prefetchOffset += available;
+                if (_prefetchOffset >= _prefetchLength)
+                {
+                    _prefetch = Array.Empty<byte>();
+                }
+
+                return available;
+            }
+
+            private static void ValidateBuffer(byte[] buffer, int offset, int count)
+            {
+                if (buffer == null)
+                {
+                    throw new ArgumentNullException(nameof(buffer));
+                }
+
+                if (offset < 0 || count < 0 || buffer.Length - offset < count)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(offset));
+                }
+            }
         }
 
         private SslClientAuthenticationOptions BuildAuthenticationOptions(string targetHost)
