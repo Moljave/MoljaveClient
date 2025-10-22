@@ -40,18 +40,14 @@ namespace Moljave.Http
 
             maxConnections = Math.Max(1, maxConnections);
 
-            var affinityHash = affinityKey == null
-                ? 0
-                : RuntimeHelpers.GetHashCode(affinityKey);
-
-            var key = new PoolKey(
+            var key = CreatePoolKey(
                 host,
                 port,
                 useTls,
-                BuildFingerprintSignature(fingerprint),
-                BuildTlsSignature(tlsSettings),
-                BuildProxySignature(proxyDescriptor),
-                affinityHash,
+                fingerprint,
+                tlsSettings,
+                proxyDescriptor,
+                affinityKey,
                 socketBufferSize);
 
             var state = _states.GetOrAdd(key, _ => new PoolState());
@@ -87,6 +83,62 @@ namespace Moljave.Http
                 semaphore.Release();
                 throw;
             }
+        }
+
+        public void Clear(
+            string host,
+            int port,
+            bool useTls,
+            JA3Fingerprint fingerprint,
+            MojaveTlsSettings tlsSettings,
+            ProxyDescriptor proxyDescriptor,
+            object affinityKey,
+            int socketBufferSize)
+        {
+            if (string.IsNullOrEmpty(host))
+            {
+                return;
+            }
+
+            var key = CreatePoolKey(
+                host,
+                port,
+                useTls,
+                fingerprint,
+                tlsSettings,
+                proxyDescriptor,
+                affinityKey,
+                socketBufferSize);
+
+            if (_states.TryGetValue(key, out var state))
+            {
+                state.ClearQueue();
+            }
+        }
+
+        private static PoolKey CreatePoolKey(
+            string host,
+            int port,
+            bool useTls,
+            JA3Fingerprint fingerprint,
+            MojaveTlsSettings tlsSettings,
+            ProxyDescriptor proxyDescriptor,
+            object affinityKey,
+            int socketBufferSize)
+        {
+            var affinityHash = affinityKey == null
+                ? 0
+                : RuntimeHelpers.GetHashCode(affinityKey);
+
+            return new PoolKey(
+                host,
+                port,
+                useTls,
+                BuildFingerprintSignature(fingerprint),
+                BuildTlsSignature(tlsSettings),
+                BuildProxySignature(proxyDescriptor),
+                affinityHash,
+                socketBufferSize);
         }
 
         internal void Return(
@@ -258,6 +310,14 @@ namespace Moljave.Http
                 }
 
                 return _semaphore;
+            }
+
+            public void ClearQueue()
+            {
+                while (_queue.TryDequeue(out var client))
+                {
+                    client?.Dispose();
+                }
             }
         }
     }

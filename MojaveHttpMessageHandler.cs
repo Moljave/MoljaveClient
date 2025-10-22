@@ -247,14 +247,24 @@ namespace Moljave.Http
                 {
                     lease?.MarkUnusable();
 
-                    if (TlsPlatformSupport.TryDisableCipherSuitesPolicy(ex))
+                    var exceptionToHandle = AugmentSocketBufferSpaceException(
+                        ex,
+                        uri,
+                        targetPort,
+                        useTls,
+                        fingerprint,
+                        tlsSettings,
+                        proxyOptions,
+                        cookieManager);
+
+                    if (TlsPlatformSupport.TryDisableCipherSuitesPolicy(exceptionToHandle))
                     {
-                        lastException = ex;
+                        lastException = exceptionToHandle;
                         attempt--;
                         continue;
                     }
 
-                    var transformed = NormalizeProxyException(ex, proxyOptions);
+                    var transformed = NormalizeProxyException(exceptionToHandle, proxyOptions);
 
                     if (attempt < maxRetries && ShouldRetry(transformed, proxyOptions))
                     {
@@ -737,6 +747,59 @@ namespace Moljave.Http
             var delayMilliseconds = baseDelay.TotalMilliseconds * multiplier;
             var cappedMilliseconds = Math.Min(delayMilliseconds, 2000);
             return TimeSpan.FromMilliseconds(cappedMilliseconds);
+        }
+
+        private Exception AugmentSocketBufferSpaceException(
+            Exception exception,
+            Uri uri,
+            int port,
+            bool useTls,
+            JA3Fingerprint fingerprint,
+            MojaveTlsSettings tlsSettings,
+            MojaveProxyOptions proxyOptions,
+            MojaveCookieManager cookieManager)
+        {
+            var socketException = FindSocketException(exception);
+            if (socketException == null || socketException.SocketErrorCode != SocketError.NoBufferSpaceAvailable)
+            {
+                return exception;
+            }
+
+            TlsConnectionPool.Shared.Clear(
+                uri?.Host,
+                port,
+                useTls,
+                fingerprint,
+                tlsSettings,
+                proxyOptions?.Descriptor,
+                cookieManager,
+                _options.SocketBufferSize);
+
+            var messageBuilder = new StringBuilder();
+            messageBuilder.Append("The operating system ran out of socket buffer space while communicating with ");
+            messageBuilder.Append(uri?.Host ?? "the remote host");
+            messageBuilder.Append('.');
+
+            messageBuilder.Append(' ');
+            messageBuilder.Append("Reduce concurrent connections or lower MojaveHttpClientOptions.SocketBufferSize to avoid exhausting kernel buffers.");
+
+            return new HttpRequestException(messageBuilder.ToString(), socketException);
+        }
+
+        private static SocketException FindSocketException(Exception exception)
+        {
+            var current = exception;
+            while (current != null)
+            {
+                if (current is SocketException socketException)
+                {
+                    return socketException;
+                }
+
+                current = current.InnerException;
+            }
+
+            return null;
         }
 
         private SslClientAuthenticationOptions BuildHttp2SslOptions(
