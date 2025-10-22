@@ -18,13 +18,15 @@ namespace Moljave.Http
     {
         private static readonly IdnMapping s_idnMapping = new();
 
+        private const int MinimumSocketBufferSize = 1024;
+
         private readonly string _host;
         private readonly int _port;
         private readonly JA3Fingerprint _fingerprint;
         private readonly ProxyDescriptor _proxy;
         private readonly MojaveTlsSettings _tlsSettings;
         private readonly RemoteCertificateValidationCallback _certificateValidationCallback;
-        private readonly int _socketBufferSize;
+        private int _socketBufferSize;
 
         private TcpClient _tcpClient;
         private Stream _transportStream;
@@ -46,7 +48,15 @@ namespace Moljave.Http
             _proxy = proxy;
             _tlsSettings = tlsSettings ?? MojaveTlsSettings.Default;
             _certificateValidationCallback = certificateValidationCallback ?? ((_, _, _, _) => true);
-            _socketBufferSize = socketBufferSize <= 0 ? 0 : Math.Max(socketBufferSize, 4096);
+            if (socketBufferSize <= 0)
+            {
+                _socketBufferSize = 0;
+            }
+            else
+            {
+                var sanitized = Math.Max(socketBufferSize, MinimumSocketBufferSize);
+                _socketBufferSize = sanitized;
+            }
         }
 
         public async Task<byte[]> SendRequestAsync(byte[] requestBytes, CancellationToken cancellationToken, bool useTls)
@@ -120,29 +130,46 @@ namespace Moljave.Http
                 return _transportStream;
             }
 
-            _tcpClient = new TcpClient
+            while (true)
             {
-                NoDelay = true,
-                // Use an abortive close so sockets do not pile up in TIME_WAIT when running at high volume.
-                LingerState = new LingerOption(enable: true, seconds: 0)
-            };
+                var tcpClient = new TcpClient
+                {
+                    NoDelay = true,
+                    // Use an abortive close so sockets do not pile up in TIME_WAIT when running at high volume.
+                    LingerState = new LingerOption(enable: true, seconds: 0)
+                };
 
-            TryConfigureSocketBuffers(_tcpClient, _socketBufferSize);
+                TryConfigureSocketBuffers(tcpClient, _socketBufferSize);
+                ConfigureForHighVolumeReuse(tcpClient);
 
-            ConfigureForHighVolumeReuse(_tcpClient);
+                _tcpClient = tcpClient;
 
-            if (_proxy == null)
-            {
-                var targetHost = NormalizeHostname(_host);
-                await _tcpClient.ConnectAsync(targetHost, _port).WaitAsync(cancellationToken).ConfigureAwait(false);
-                _transportStream = _tcpClient.GetStream();
+                try
+                {
+                    if (_proxy == null)
+                    {
+                        var targetHost = NormalizeHostname(_host);
+                        await tcpClient.ConnectAsync(targetHost, _port).WaitAsync(cancellationToken).ConfigureAwait(false);
+                        _transportStream = tcpClient.GetStream();
+                    }
+                    else
+                    {
+                        await ConnectThroughProxyAsync(cancellationToken).ConfigureAwait(false);
+                    }
+
+                    return _transportStream;
+                }
+                catch (Exception ex) when (IsNoBufferSpaceAvailable(ex) && TryReduceSocketBufferSize())
+                {
+                    CleanupFailedConnection();
+                    continue;
+                }
+                catch
+                {
+                    CleanupFailedConnection();
+                    throw;
+                }
             }
-            else
-            {
-                await ConnectThroughProxyAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            return _transportStream;
         }
 
         private async Task<Stream> GetActiveStreamAsync(bool useTls, CancellationToken cancellationToken)
@@ -313,6 +340,62 @@ namespace Moljave.Http
             catch (ObjectDisposedException)
             {
             }
+        }
+
+        private static bool IsNoBufferSpaceAvailable(Exception exception)
+        {
+            if (exception == null)
+            {
+                return false;
+            }
+
+            var current = exception;
+            while (current != null)
+            {
+                if (current is SocketException socketException &&
+                    socketException.SocketErrorCode == SocketError.NoBufferSpaceAvailable)
+                {
+                    return true;
+                }
+
+                current = current.InnerException;
+            }
+
+            return false;
+        }
+
+        private bool TryReduceSocketBufferSize()
+        {
+            if (_socketBufferSize <= 0)
+            {
+                return false;
+            }
+
+            if (_socketBufferSize <= MinimumSocketBufferSize)
+            {
+                _socketBufferSize = 0;
+                return true;
+            }
+
+            var reduced = Math.Max(MinimumSocketBufferSize, _socketBufferSize / 2);
+            if (reduced == _socketBufferSize)
+            {
+                reduced = MinimumSocketBufferSize;
+            }
+
+            _socketBufferSize = reduced;
+            return true;
+        }
+
+        private void CleanupFailedConnection()
+        {
+            _sslStream?.Dispose();
+            _transportStream?.Dispose();
+            _tcpClient?.Dispose();
+
+            _sslStream = null;
+            _transportStream = null;
+            _tcpClient = null;
         }
 
         private async Task ConnectThroughProxyAsync(CancellationToken cancellationToken)
@@ -1231,12 +1314,7 @@ namespace Moljave.Http
             }
 
             _disposed = true;
-            _sslStream?.Dispose();
-            _transportStream?.Dispose();
-            _tcpClient?.Dispose();
-            _sslStream = null;
-            _transportStream = null;
-            _tcpClient = null;
+            CleanupFailedConnection();
         }
     }
 }
