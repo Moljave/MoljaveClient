@@ -61,7 +61,7 @@ namespace Moljave.Http
                 {
                     if (existing != null && existing.IsReusable)
                     {
-                        return new TlsClientLease(this, key, state, semaphore, existing);
+                        return new TlsClientLease(this, state, existing);
                     }
 
                     existing?.Dispose();
@@ -76,11 +76,11 @@ namespace Moljave.Http
                     certificateValidationCallback,
                     socketBufferSize);
 
-                return new TlsClientLease(this, key, state, semaphore, client);
+                return new TlsClientLease(this, state, client);
             }
             catch
             {
-                semaphore.Release();
+                state.ReleaseLease();
                 throw;
             }
         }
@@ -116,6 +116,38 @@ namespace Moljave.Http
             }
         }
 
+        public void AdjustMaxConnections(
+            string host,
+            int port,
+            bool useTls,
+            JA3Fingerprint fingerprint,
+            MojaveTlsSettings tlsSettings,
+            ProxyDescriptor proxyDescriptor,
+            object affinityKey,
+            int socketBufferSize,
+            int maxConnections)
+        {
+            if (string.IsNullOrEmpty(host))
+            {
+                return;
+            }
+
+            var key = CreatePoolKey(
+                host,
+                port,
+                useTls,
+                fingerprint,
+                tlsSettings,
+                proxyDescriptor,
+                affinityKey,
+                socketBufferSize);
+
+            if (_states.TryGetValue(key, out var state))
+            {
+                state.AdjustMaxConnections(maxConnections);
+            }
+        }
+
         private static PoolKey CreatePoolKey(
             string host,
             int port,
@@ -142,26 +174,17 @@ namespace Moljave.Http
         }
 
         internal void Return(
-            PoolKey key,
             PoolState state,
-            SemaphoreSlim semaphore,
             TlsClient client,
             bool canReuse)
         {
             try
             {
-                if (canReuse && client != null && client.IsReusable)
-                {
-                    state.Queue.Enqueue(client);
-                }
-                else
-                {
-                    client?.Dispose();
-                }
+                state.ReturnClient(client, canReuse);
             }
             finally
             {
-                semaphore.Release();
+                state.ReleaseLease();
             }
         }
 
@@ -283,33 +306,27 @@ namespace Moljave.Http
             private readonly ConcurrentQueue<TlsClient> _queue = new();
             private SemaphoreSlim _semaphore;
             private int _maxConnections;
+            private int _reservedPermits;
 
             public ConcurrentQueue<TlsClient> Queue => _queue;
 
             public SemaphoreSlim GetSemaphore(int maxConnections)
             {
-                if (_semaphore == null)
-                {
-                    lock (this)
-                    {
-                        _semaphore ??= new SemaphoreSlim(maxConnections, maxConnections);
-                        _maxConnections = maxConnections;
-                    }
-                }
-                else if (maxConnections > _maxConnections)
-                {
-                    lock (this)
-                    {
-                        if (maxConnections > _maxConnections)
-                        {
-                            var difference = maxConnections - _maxConnections;
-                            _semaphore.Release(difference);
-                            _maxConnections = maxConnections;
-                        }
-                    }
-                }
+                maxConnections = Math.Max(1, maxConnections);
 
-                return _semaphore;
+                lock (this)
+                {
+                    if (_semaphore == null)
+                    {
+                        _semaphore = new SemaphoreSlim(maxConnections, maxConnections);
+                        _maxConnections = maxConnections;
+                        _reservedPermits = 0;
+                        return _semaphore;
+                    }
+
+                    AdjustMaxConnectionsLocked(maxConnections);
+                    return _semaphore;
+                }
             }
 
             public void ClearQueue()
@@ -319,29 +336,120 @@ namespace Moljave.Http
                     client?.Dispose();
                 }
             }
+
+            public void AdjustMaxConnections(int maxConnections)
+            {
+                if (_semaphore == null)
+                {
+                    return;
+                }
+
+                maxConnections = Math.Max(1, maxConnections);
+
+                lock (this)
+                {
+                    AdjustMaxConnectionsLocked(maxConnections);
+                }
+            }
+
+            private void AdjustMaxConnectionsLocked(int maxConnections)
+            {
+                if (_semaphore == null)
+                {
+                    return;
+                }
+
+                if (maxConnections == _maxConnections)
+                {
+                    return;
+                }
+
+                if (maxConnections > _maxConnections)
+                {
+                    var difference = maxConnections - _maxConnections;
+
+                    if (_reservedPermits > 0)
+                    {
+                        var restore = Math.Min(_reservedPermits, difference);
+                        _reservedPermits -= restore;
+                        difference -= restore;
+                    }
+
+                    if (difference > 0)
+                    {
+                        _semaphore.Release(difference);
+                    }
+                }
+                else
+                {
+                    var difference = _maxConnections - maxConnections;
+                    var drained = 0;
+                    for (; drained < difference; drained++)
+                    {
+                        if (!_semaphore.Wait(0))
+                        {
+                            break;
+                        }
+                    }
+
+                    var remaining = difference - drained;
+                    if (remaining > 0)
+                    {
+                        _reservedPermits += remaining;
+                    }
+                }
+
+                _maxConnections = maxConnections;
+            }
+
+            public void ReturnClient(TlsClient client, bool canReuse)
+            {
+                if (canReuse && client != null && client.IsReusable)
+                {
+                    _queue.Enqueue(client);
+                }
+                else
+                {
+                    client?.Dispose();
+                }
+            }
+
+            public void ReleaseLease()
+            {
+                var semaphore = _semaphore;
+                if (semaphore == null)
+                {
+                    return;
+                }
+
+                lock (this)
+                {
+                    if (_reservedPermits > 0)
+                    {
+                        _reservedPermits--;
+                        return;
+                    }
+                }
+
+                semaphore.Release();
+            }
         }
     }
 
     internal sealed class TlsClientLease : IDisposable
     {
         private readonly TlsConnectionPool _pool;
-        private readonly TlsConnectionPool.PoolKey _key;
         private readonly TlsConnectionPool.PoolState _state;
-        private readonly SemaphoreSlim _semaphore;
         private bool _disposed;
         private bool _canReuse;
 
         public TlsClientLease(
             TlsConnectionPool pool,
-            TlsConnectionPool.PoolKey key,
             TlsConnectionPool.PoolState state,
-            SemaphoreSlim semaphore,
             TlsClient client)
         {
             _pool = pool ?? throw new ArgumentNullException(nameof(pool));
-            _key = key;
             _state = state ?? throw new ArgumentNullException(nameof(state));
-            _semaphore = semaphore ?? throw new ArgumentNullException(nameof(semaphore));
             Client = client ?? throw new ArgumentNullException(nameof(client));
             _canReuse = false;
         }
@@ -366,7 +474,7 @@ namespace Moljave.Http
             }
 
             _disposed = true;
-            _pool.Return(_key, _state, _semaphore, Client, _canReuse);
+            _pool.Return(_state, Client, _canReuse);
         }
     }
 }

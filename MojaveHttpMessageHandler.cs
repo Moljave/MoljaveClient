@@ -786,7 +786,21 @@ namespace Moljave.Http
                         "The operating system ran out of socket buffer space while communicating with ",
                         "Reduce concurrent connections or lower MojaveHttpClientOptions.SocketBufferSize to avoid exhausting kernel buffers.",
                         socketBufferSize);
-                    _options.TryReduceSocketBufferSize(socketBufferSize);
+                    var socketBufferReduced = _options.TryReduceSocketBufferSize(socketBufferSize);
+                    var maxConnectionsReduced = _options.TryReduceMaxConnectionsPerHost(maxConnectionsPerHost);
+                    if (maxConnectionsReduced)
+                    {
+                        ReducePoolMaxConnections(
+                            uri,
+                            port,
+                            useTls,
+                            fingerprint,
+                            tlsSettings,
+                            proxyOptions,
+                            cookieManager,
+                            socketBufferSize,
+                            socketBufferReduced);
+                    }
                     return noBufferSpaceException;
                 case SocketError.AddressAlreadyInUse:
                     var addressInUseException = CreateSocketResourceException(
@@ -801,7 +815,19 @@ namespace Moljave.Http
                         "The operating system refused to open a new socket because the local port range is exhausted while communicating with ",
                         "Reduce concurrent connections or lower MojaveHttpClientOptions.MaxConnectionsPerHost to avoid running out of ephemeral ports.",
                         socketBufferSize);
-                    _options.TryReduceMaxConnectionsPerHost(maxConnectionsPerHost);
+                    if (_options.TryReduceMaxConnectionsPerHost(maxConnectionsPerHost))
+                    {
+                        ReducePoolMaxConnections(
+                            uri,
+                            port,
+                            useTls,
+                            fingerprint,
+                            tlsSettings,
+                            proxyOptions,
+                            cookieManager,
+                            socketBufferSize,
+                            socketBufferReduced: false);
+                    }
                     return addressInUseException;
                 default:
                     return exception;
@@ -839,6 +865,60 @@ namespace Moljave.Http
             messageBuilder.Append(mitigationMessage);
 
             return new HttpRequestException(messageBuilder.ToString(), socketException);
+        }
+
+        private void ReducePoolMaxConnections(
+            Uri uri,
+            int port,
+            bool useTls,
+            JA3Fingerprint fingerprint,
+            MojaveTlsSettings tlsSettings,
+            MojaveProxyOptions proxyOptions,
+            MojaveCookieManager cookieManager,
+            int observedSocketBufferSize,
+            bool socketBufferReduced)
+        {
+            if (uri == null)
+            {
+                return;
+            }
+
+            var descriptor = proxyOptions?.Descriptor;
+            var affinityKey = (object)cookieManager;
+            var maxConnections = _options.MaxConnectionsPerHost;
+
+            TlsConnectionPool.Shared.AdjustMaxConnections(
+                uri.Host,
+                port,
+                useTls,
+                fingerprint,
+                tlsSettings,
+                descriptor,
+                affinityKey,
+                observedSocketBufferSize,
+                maxConnections);
+
+            if (!socketBufferReduced)
+            {
+                return;
+            }
+
+            var newSocketBufferSize = _options.SocketBufferSize;
+            if (newSocketBufferSize == observedSocketBufferSize)
+            {
+                return;
+            }
+
+            TlsConnectionPool.Shared.AdjustMaxConnections(
+                uri.Host,
+                port,
+                useTls,
+                fingerprint,
+                tlsSettings,
+                descriptor,
+                affinityKey,
+                newSocketBufferSize,
+                maxConnections);
         }
 
         private static SocketException FindSocketException(Exception exception)
