@@ -81,7 +81,7 @@ namespace Moljave.Http
 
                 HttpResponseMessage response = ShouldUseHttp2(currentRequest)
                     ? await SendHttp2Async(currentRequest, uri, effectiveTimeout, fingerprint, tlsSettings, proxyContext, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false)
-                    : await SendHttp11Async(currentRequest, uri, useTls, effectiveTimeout, fingerprint, tlsSettings, proxyContext, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false);
+                    : await SendHttp11Async(currentRequest, uri, useTls, effectiveTimeout, fingerprint, tlsSettings, proxyContext, cookieManager, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false);
 
                 if (cookieManager != null && response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
                 {
@@ -165,6 +165,7 @@ namespace Moljave.Http
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings,
             ProxyRotationContext proxyContext,
+            MojaveCookieManager cookieManager,
             int maxRetries,
             TimeSpan retryDelay,
             CancellationToken cancellationToken)
@@ -199,6 +200,7 @@ namespace Moljave.Http
                         fingerprint,
                         tlsSettings,
                         proxyOptions.Descriptor,
+                        cookieManager,
                         _options.CertificateValidationCallback,
                         _options.MaxConnectionsPerHost,
                         waitToken).ConfigureAwait(false);
