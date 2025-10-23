@@ -299,7 +299,7 @@ namespace Moljave.Http
                     {
                         lastException = transformed;
                         proxyContext?.NotifyFailure(proxyOptions, transformed);
-                        await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                        await DelayForRetryAsync(attempt, retryDelay, transformed, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
@@ -407,7 +407,7 @@ namespace Moljave.Http
                     {
                         lastException = proxyException;
                         proxyContext?.NotifyFailure(proxyOptions, proxyException);
-                        await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                        await DelayForRetryAsync(attempt, retryDelay, proxyException, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
@@ -431,7 +431,7 @@ namespace Moljave.Http
                         if (attempt < maxRetries && IsRetryableProxyError(proxyException))
                         {
                             proxyContext?.NotifyFailure(proxyOptions, proxyException);
-                            await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                            await DelayForRetryAsync(attempt, retryDelay, proxyException, cancellationToken).ConfigureAwait(false);
                             continue;
                         }
 
@@ -442,7 +442,7 @@ namespace Moljave.Http
                     if (attempt < maxRetries && ShouldRetry(transformed, proxyOptions))
                     {
                         proxyContext?.NotifyFailure(proxyOptions, transformed);
-                        await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                        await DelayForRetryAsync(attempt, retryDelay, transformed, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
@@ -464,7 +464,7 @@ namespace Moljave.Http
                     {
                         lastException = transformed;
                         proxyContext?.NotifyFailure(proxyOptions, transformed);
-                        await DelayForRetryAsync(attempt, retryDelay, cancellationToken).ConfigureAwait(false);
+                        await DelayForRetryAsync(attempt, retryDelay, transformed, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
@@ -766,22 +766,32 @@ namespace Moljave.Http
             return cookieManager;
         }
 
-        private static async Task DelayForRetryAsync(int attempt, TimeSpan baseDelay, CancellationToken cancellationToken)
+        private static async Task DelayForRetryAsync(
+            int attempt,
+            TimeSpan baseDelay,
+            Exception exception,
+            CancellationToken cancellationToken)
         {
-            if (baseDelay <= TimeSpan.Zero)
+            var effectiveDelay = CalculateDelay(baseDelay, attempt, exception);
+            if (effectiveDelay > TimeSpan.Zero)
             {
-                return;
-            }
-
-            var scaledDelay = CalculateDelay(baseDelay, attempt);
-            if (scaledDelay > TimeSpan.Zero)
-            {
-                await Task.Delay(scaledDelay, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(effectiveDelay, cancellationToken).ConfigureAwait(false);
             }
         }
 
-        private static TimeSpan CalculateDelay(TimeSpan baseDelay, int attempt)
+        private static TimeSpan CalculateDelay(TimeSpan baseDelay, int attempt, Exception exception)
         {
+            var socketException = FindSocketException(exception);
+            if (socketException?.SocketErrorCode == SocketError.AccessDenied)
+            {
+                return TimeSpan.FromSeconds(3);
+            }
+
+            if (baseDelay <= TimeSpan.Zero)
+            {
+                return TimeSpan.Zero;
+            }
+
             var multiplier = Math.Pow(2, Math.Max(0, attempt));
             var delayMilliseconds = baseDelay.TotalMilliseconds * multiplier;
             var cappedMilliseconds = Math.Min(delayMilliseconds, 2000);
