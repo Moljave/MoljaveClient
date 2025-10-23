@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Buffers.Text;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -80,25 +81,10 @@ namespace Moljave.Http
             var headerResult = await ReadHeadersAsync(activeStream, cancellationToken).ConfigureAwait(false);
             memoryStream.Write(headerResult.HeaderBuffer, 0, headerResult.HeaderLength);
 
-            var headersText = Encoding.ASCII.GetString(headerResult.HeaderBuffer, 0, headerResult.HeaderLength);
-            int contentLength = 0;
-            bool hasContentLength = false;
-            bool isChunked = false;
-
-            foreach (var line in headersText.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
-                {
-                    hasContentLength = true;
-                    int.TryParse(line[15..].Trim(), out contentLength);
-                }
-
-                if (line.StartsWith("Transfer-Encoding:", StringComparison.OrdinalIgnoreCase) &&
-                    line.IndexOf("chunked", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    isChunked = true;
-                }
-            }
+            ParseBodyMetadata(headerResult.HeaderBuffer.AsSpan(0, headerResult.HeaderLength),
+                out bool hasContentLength,
+                out int contentLength,
+                out bool isChunked);
 
             using var responseStream = new BufferedReadStream(activeStream, headerResult.PrefetchBuffer, headerResult.PrefetchLength);
 
@@ -838,81 +824,329 @@ namespace Moljave.Http
 
         private static async Task ReadChunkedBodyAsync(Stream stream, MemoryStream destination, CancellationToken cancellationToken)
         {
-            while (true)
+            var buffer = ArrayPool<byte>.Shared.Rent(8192);
+
+            try
             {
-                var line = await ReadLineAsync(stream, cancellationToken).ConfigureAwait(false);
-                if (string.IsNullOrEmpty(line))
+                while (true)
                 {
-                    line = await ReadLineAsync(stream, cancellationToken).ConfigureAwait(false);
-                }
+                    var line = await ReadLineAsync(stream, cancellationToken).ConfigureAwait(false);
+                    if (string.IsNullOrEmpty(line))
+                    {
+                        line = await ReadLineAsync(stream, cancellationToken).ConfigureAwait(false);
+                    }
 
-                var size = int.Parse(line.Split(';')[0], System.Globalization.NumberStyles.HexNumber);
-                if (size == 0)
-                {
+                    var lineSpan = line.AsSpan();
+                    var separatorIndex = lineSpan.IndexOf(';');
+                    if (separatorIndex >= 0)
+                    {
+                        lineSpan = lineSpan[..separatorIndex];
+                    }
+
+                    lineSpan = TrimAsciiWhitespace(lineSpan);
+                    if (!int.TryParse(lineSpan, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var size))
+                    {
+                        throw new IOException($"Invalid chunk size '{line}'.");
+                    }
+
+                    if (size == 0)
+                    {
+                        await ReadLineAsync(stream, cancellationToken).ConfigureAwait(false);
+                        break;
+                    }
+
+                    var remaining = size;
+                    while (remaining > 0)
+                    {
+                        var toRead = Math.Min(remaining, buffer.Length);
+                        var read = await stream.ReadAsync(buffer.AsMemory(0, toRead), cancellationToken).ConfigureAwait(false);
+                        if (read == 0)
+                        {
+                            throw new IOException("Unexpected end of stream while reading chunked body.");
+                        }
+
+                        destination.Write(buffer, 0, read);
+                        remaining -= read;
+                    }
+
                     await ReadLineAsync(stream, cancellationToken).ConfigureAwait(false);
-                    break;
                 }
-
-                var buffer = new byte[size];
-                await ReadExactAsync(stream, buffer, cancellationToken).ConfigureAwait(false);
-                destination.Write(buffer, 0, buffer.Length);
-                await ReadLineAsync(stream, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
             }
         }
 
         private static async Task ReadFixedBodyAsync(Stream stream, MemoryStream destination, int length, CancellationToken cancellationToken)
         {
-            var buffer = new byte[8192];
-            int remaining = length;
-            while (remaining > 0)
-            {
-                var toRead = Math.Min(buffer.Length, remaining);
-                var read = await stream.ReadAsync(buffer, 0, toRead, cancellationToken).ConfigureAwait(false);
-                if (read == 0)
-                {
-                    break;
-                }
+            var buffer = ArrayPool<byte>.Shared.Rent(8192);
 
-                destination.Write(buffer, 0, read);
-                remaining -= read;
+            try
+            {
+                int remaining = length;
+                while (remaining > 0)
+                {
+                    var toRead = Math.Min(buffer.Length, remaining);
+                    var read = await stream.ReadAsync(buffer.AsMemory(0, toRead), cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    destination.Write(buffer, 0, read);
+                    remaining -= read;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
             }
         }
 
         private static async Task ReadUntilEndAsync(Stream stream, MemoryStream destination, CancellationToken cancellationToken)
         {
-            var buffer = new byte[8192];
-            while (true)
+            var buffer = ArrayPool<byte>.Shared.Rent(8192);
+
+            try
             {
-                var read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
-                if (read == 0)
+                while (true)
+                {
+                    var read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    destination.Write(buffer, 0, read);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        private static void ParseBodyMetadata(
+            ReadOnlySpan<byte> headerSpan,
+            out bool hasContentLength,
+            out int contentLength,
+            out bool isChunked)
+        {
+            hasContentLength = false;
+            contentLength = 0;
+            isChunked = false;
+
+            var index = 0;
+            var firstLine = true;
+
+            while (index < headerSpan.Length)
+            {
+                var remaining = headerSpan.Slice(index);
+                var newlineIndex = remaining.IndexOf((byte)'\n');
+                if (newlineIndex < 0)
                 {
                     break;
                 }
 
-                destination.Write(buffer, 0, read);
+                var lineWithTerminator = remaining.Slice(0, newlineIndex + 1);
+                index += newlineIndex + 1;
+
+                var line = TrimHeaderLine(lineWithTerminator);
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+
+                if (firstLine)
+                {
+                    firstLine = false;
+                    continue;
+                }
+
+                var separatorIndex = line.IndexOf((byte)':');
+                if (separatorIndex <= 0)
+                {
+                    continue;
+                }
+
+                var name = line.Slice(0, separatorIndex);
+                var value = TrimAsciiWhitespace(line.Slice(separatorIndex + 1));
+
+                if (!hasContentLength && EqualsAsciiIgnoreCase(name, "Content-Length") &&
+                    Utf8Parser.TryParse(value, out int parsedLength, out int consumed) && consumed == value.Length)
+                {
+                    hasContentLength = true;
+                    contentLength = parsedLength;
+                    continue;
+                }
+
+                if (!isChunked && EqualsAsciiIgnoreCase(name, "Transfer-Encoding") &&
+                    ContainsAsciiIgnoreCase(value, "chunked"))
+                {
+                    isChunked = true;
+                }
             }
+        }
+
+        private static ReadOnlySpan<byte> TrimHeaderLine(ReadOnlySpan<byte> line)
+        {
+            int start = 0;
+            int end = line.Length;
+
+            while (start < end && (line[start] == (byte)'\r' || line[start] == (byte)'\n'))
+            {
+                start++;
+            }
+
+            while (end > start && (line[end - 1] == (byte)'\r' || line[end - 1] == (byte)'\n'))
+            {
+                end--;
+            }
+
+            return line.Slice(start, end - start);
+        }
+
+        private static ReadOnlySpan<byte> TrimAsciiWhitespace(ReadOnlySpan<byte> value)
+        {
+            int start = 0;
+            int end = value.Length;
+
+            while (start < end && IsAsciiWhitespace(value[start]))
+            {
+                start++;
+            }
+
+            while (end > start && IsAsciiWhitespace(value[end - 1]))
+            {
+                end--;
+            }
+
+            return value.Slice(start, end - start);
+        }
+
+        private static ReadOnlySpan<char> TrimAsciiWhitespace(ReadOnlySpan<char> value)
+        {
+            int start = 0;
+            int end = value.Length;
+
+            while (start < end && IsAsciiWhitespace(value[start]))
+            {
+                start++;
+            }
+
+            while (end > start && IsAsciiWhitespace(value[end - 1]))
+            {
+                end--;
+            }
+
+            return value.Slice(start, end - start);
+        }
+
+        private static bool EqualsAsciiIgnoreCase(ReadOnlySpan<byte> left, string right)
+        {
+            if (right == null || left.Length != right.Length)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < right.Length; i++)
+            {
+                if (ToLowerAscii(left[i]) != ToLowerAscii((byte)right[i]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool ContainsAsciiIgnoreCase(ReadOnlySpan<byte> span, string value)
+        {
+            if (value == null || value.Length == 0 || span.Length < value.Length)
+            {
+                return false;
+            }
+
+            for (int i = 0; i <= span.Length - value.Length; i++)
+            {
+                if (EqualsAsciiIgnoreCase(span.Slice(i, value.Length), value))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsAsciiWhitespace(byte value)
+        {
+            return value == (byte)' ' || value == (byte)'\t' || value == (byte)'\r' || value == (byte)'\n';
+        }
+
+        private static bool IsAsciiWhitespace(char value)
+        {
+            return value == ' ' || value == '\t' || value == '\r' || value == '\n';
+        }
+
+        private static byte ToLowerAscii(byte value)
+        {
+            if ((uint)(value - 'A') <= ('Z' - 'A'))
+            {
+                return (byte)(value | 0x20);
+            }
+
+            return value;
         }
 
         private static async Task<string> ReadLineAsync(Stream stream, CancellationToken cancellationToken)
         {
-            var buffer = new List<byte>();
-            var single = new byte[1];
-            while (true)
+            var writer = new ArrayBufferWriter<byte>(128);
+            var single = ArrayPool<byte>.Shared.Rent(1);
+
+            try
             {
-                var read = await stream.ReadAsync(single, 0, 1, cancellationToken).ConfigureAwait(false);
-                if (read == 0)
+                while (true)
                 {
-                    break;
+                    var read = await stream.ReadAsync(single.AsMemory(0, 1), cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    var span = writer.GetSpan(1);
+                    span[0] = single[0];
+                    writer.Advance(1);
+
+                    if (single[0] == (byte)'\n')
+                    {
+                        break;
+                    }
                 }
 
-                buffer.Add(single[0]);
-                if (single[0] == (byte)'\n')
+                if (writer.WrittenCount == 0)
                 {
-                    break;
+                    return string.Empty;
                 }
+
+                var written = writer.WrittenSpan;
+                var end = written.Length;
+                while (end > 0 && (written[end - 1] == (byte)'\n' || written[end - 1] == (byte)'\r'))
+                {
+                    end--;
+                }
+
+                if (end <= 0)
+                {
+                    return string.Empty;
+                }
+
+                return Encoding.ASCII.GetString(written.Slice(0, end));
             }
-
-            return Encoding.ASCII.GetString(buffer.ToArray()).TrimEnd('\r', '\n');
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(single);
+            }
         }
 
         private static async Task<HeaderReadResult> ReadHeadersAsync(Stream stream, CancellationToken cancellationToken)

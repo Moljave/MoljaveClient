@@ -178,6 +178,8 @@ namespace Moljave.Http
             CancellationToken cancellationToken)
         {
             var requestWantsClose = RequestWantsConnectionClose(request);
+            byte[] cachedRequestPayload = null;
+            var requestPayloadDirty = true;
             var targetPort = uri.IsDefaultPort ? (useTls ? 443 : 80) : uri.Port;
 
             Exception lastException = null;
@@ -221,7 +223,13 @@ namespace Moljave.Http
                         linkedCts.CancelAfter(timeout);
                     }
 
-                    var requestPayload = await HttpRequestStringifier.Stringify(request).ConfigureAwait(false);
+                    if (requestPayloadDirty || cachedRequestPayload == null)
+                    {
+                        cachedRequestPayload = await HttpRequestStringifier.Stringify(request).ConfigureAwait(false);
+                        requestPayloadDirty = false;
+                    }
+
+                    var requestPayload = cachedRequestPayload;
                     var responseBytes = await lease.Client.SendRequestAsync(requestPayload, linkedCts.Token, useTls).ConfigureAwait(false);
                     var response = HttpResponseParser.Parse(responseBytes);
                     response.RequestMessage = request;
@@ -275,6 +283,7 @@ namespace Moljave.Http
                     {
                         request.Headers.ConnectionClose = true;
                         requestWantsClose = true;
+                        requestPayloadDirty = true;
                     }
 
                     if (TlsPlatformSupport.TryDisableCipherSuitesPolicy(exceptionToHandle))
