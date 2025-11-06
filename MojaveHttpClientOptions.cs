@@ -25,6 +25,8 @@ namespace Moljave.Http
         public Func<JA3Fingerprint> FingerprintProvider { get; set; } =
             () => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome);
 
+        public bool EnableJa3Fingerprinting { get; set; } = true;
+
         public Func<MojaveTlsSettings> TlsSettingsProvider { get; set; } = () => MojaveTlsSettings.Default;
 
         public Func<MojaveProxyOptions> ProxyResolver { get; set; }

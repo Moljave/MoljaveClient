@@ -23,6 +23,8 @@ namespace Moljave.Http
         private Func<JA3Fingerprint> _fingerprintFactory;
         private JA3Fingerprint _currentFingerprint;
 
+        private readonly bool _ja3FingerprintingEnabled;
+
         private Func<MojaveProxyOptions> _defaultProxyResolver;
         private Func<MojaveProxyOptions> _overrideProxyResolver;
         private MojaveProxyOptions _staticProxyOptions;
@@ -69,13 +71,24 @@ namespace Moljave.Http
             PlatformRequirements.EnsureSupportedWindows();
 
             _options = options ?? throw new ArgumentNullException(nameof(options));
+            _ja3FingerprintingEnabled = _options.EnableJa3Fingerprinting;
+
             _cookieManager = _options.CookieManager ?? new MojaveCookieManager();
             _options.CookieManager = _cookieManager;
 
             _defaultRequestHeaders = _defaultRequest.Headers;
 
-            InitializeFingerprint(_options.FingerprintProvider);
-            _options.FingerprintProvider = ResolveFingerprint;
+            if (_ja3FingerprintingEnabled)
+            {
+                InitializeFingerprint(_options.FingerprintProvider);
+                _options.FingerprintProvider = ResolveFingerprint;
+            }
+            else
+            {
+                _fingerprintFactory = null;
+                _currentFingerprint = null;
+                _options.FingerprintProvider = null;
+            }
 
             InitializeProxy(_options.ProxyResolver);
             _options.ProxyResolver = ResolveProxy;
@@ -370,6 +383,8 @@ namespace Moljave.Http
 
         public void RotateFingerprint()
         {
+            EnsureJa3FingerprintingEnabled();
+
             lock (_fingerprintLock)
             {
                 _currentFingerprint = (_fingerprintFactory ?? DefaultFingerprintFactory)();
@@ -378,6 +393,8 @@ namespace Moljave.Http
 
         public void UseFingerprintProvider(Func<JA3Fingerprint> provider, bool rotateImmediately = true)
         {
+            EnsureJa3FingerprintingEnabled();
+
             if (provider == null)
             {
                 throw new ArgumentNullException(nameof(provider));
@@ -709,6 +726,14 @@ namespace Moljave.Http
             {
                 _fingerprintFactory = fingerprintProvider ?? DefaultFingerprintFactory;
                 _currentFingerprint = null;
+            }
+        }
+
+        private void EnsureJa3FingerprintingEnabled()
+        {
+            if (!_ja3FingerprintingEnabled)
+            {
+                throw new InvalidOperationException("JA3 spoofing is disabled for this client.");
             }
         }
 

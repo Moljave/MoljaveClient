@@ -45,7 +45,7 @@ namespace Moljave.Http
         {
             _host = host ?? throw new ArgumentNullException(nameof(host));
             _port = port;
-            _fingerprint = fingerprint ?? JA3Fingerprint.Default;
+            _fingerprint = fingerprint;
             _proxy = proxy;
             _tlsSettings = tlsSettings ?? MojaveTlsSettings.Default;
             _certificateValidationCallback = certificateValidationCallback ?? ((_, _, _, _) => true);
@@ -1489,8 +1489,8 @@ namespace Moljave.Http
 
         private SslClientAuthenticationOptions BuildAuthenticationOptions(string targetHost)
         {
-            var sslProtocols = _tlsSettings.EnabledProtocols ?? _fingerprint.GetSslProtocols();
-            var applicationProtocols = _tlsSettings.ApplicationProtocols ?? _fingerprint.GetApplicationProtocols();
+            var sslProtocols = _tlsSettings.EnabledProtocols ?? _fingerprint?.GetSslProtocols() ?? SslProtocols.None;
+            var applicationProtocols = _tlsSettings.ApplicationProtocols ?? _fingerprint?.GetApplicationProtocols();
 
             var options = new SslClientAuthenticationOptions
             {
@@ -1500,7 +1500,7 @@ namespace Moljave.Http
                 ClientCertificates = new X509CertificateCollection(),
             };
 
-            var cipherSuites = _fingerprint.GetCipherSuites();
+            var cipherSuites = _fingerprint?.GetCipherSuites();
             if (cipherSuites?.Length > 0 && TlsPlatformSupport.SupportsCipherSuitesPolicy())
             {
                 try

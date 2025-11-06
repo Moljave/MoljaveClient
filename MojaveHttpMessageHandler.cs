@@ -50,7 +50,7 @@ namespace Moljave.Http
                 var effectiveTimeout = requestOptions?.Timeout ?? _options.DefaultTimeout;
                 var maxRedirects = requestOptions?.MaxAutomaticRedirections ?? _options.MaxAutomaticRedirections;
                 var cookieManager = requestOptions?.CookieManager ?? _options.CookieManager;
-                var fingerprint = requestOptions?.Fingerprint ?? _options.FingerprintProvider?.Invoke() ?? JA3Fingerprint.Default;
+                var fingerprint = GetEffectiveFingerprint(requestOptions);
                 var tlsSettings = requestOptions?.TlsSettings ?? _options.TlsSettingsProvider?.Invoke() ?? MojaveTlsSettings.Default;
                 var maxRetries = Math.Max(0, requestOptions?.MaxConnectionRetries ?? _options.MaxConnectionRetries);
                 var retryDelay = requestOptions?.RetryDelay ?? _options.ConnectionRetryDelay;
@@ -142,6 +142,21 @@ namespace Moljave.Http
 
             var resolver = _options.ProxyResolver ?? (() => MojaveProxyOptions.NoProxy);
             return ProxyRotationContext.FromResolver(resolver);
+        }
+
+        private JA3Fingerprint GetEffectiveFingerprint(MojaveRequestOptions requestOptions)
+        {
+            if (!_options.EnableJa3Fingerprinting)
+            {
+                return null;
+            }
+
+            if (requestOptions?.Fingerprint != null)
+            {
+                return requestOptions.Fingerprint;
+            }
+
+            return _options.FingerprintProvider?.Invoke() ?? JA3Fingerprint.Default;
         }
 
         private static bool IsRedirect(HttpStatusCode statusCode)
@@ -1012,9 +1027,9 @@ namespace Moljave.Http
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings)
         {
-            var sslProtocols = tlsSettings.EnabledProtocols ?? fingerprint.GetSslProtocols();
-            var cipherSuites = fingerprint.GetCipherSuites();
-            var configuredProtocols = tlsSettings.ApplicationProtocols ?? fingerprint.GetApplicationProtocols();
+            var sslProtocols = tlsSettings.EnabledProtocols ?? fingerprint?.GetSslProtocols() ?? SslProtocols.None;
+            var cipherSuites = fingerprint?.GetCipherSuites();
+            var configuredProtocols = tlsSettings.ApplicationProtocols ?? fingerprint?.GetApplicationProtocols();
 
             var sslOptions = new SslClientAuthenticationOptions
             {
@@ -1056,6 +1071,14 @@ namespace Moljave.Http
 
                     protocols.Add(new SslApplicationProtocol(Encoding.ASCII.GetBytes(protocol)));
                 }
+            }
+
+            if (protocols.Count == 0)
+            {
+                protocols.Add(SslApplicationProtocol.Http2);
+                protocols.Add(SslApplicationProtocol.Http11);
+                hasHttp2 = true;
+                hasHttp11 = true;
             }
 
             if (!hasHttp2)
