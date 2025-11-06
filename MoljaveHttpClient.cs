@@ -708,7 +708,7 @@ namespace Moljave.Http
             lock (_fingerprintLock)
             {
                 _fingerprintFactory = fingerprintProvider ?? DefaultFingerprintFactory;
-                _currentFingerprint = _fingerprintFactory();
+                _currentFingerprint = null;
             }
         }
 

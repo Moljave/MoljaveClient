@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-
 namespace Moljave.Http
 {
     public enum BrowserJa3Profile
@@ -28,6 +27,30 @@ namespace Moljave.Http
             }
         };
 
+        private static readonly Lazy<Dictionary<BrowserJa3Profile, JA3Fingerprint[]>> s_cachedFingerprints = new(() =>
+        {
+            var cache = new Dictionary<BrowserJa3Profile, JA3Fingerprint[]>(Ja3Presets.Count);
+
+            foreach (var (profile, presets) in Ja3Presets)
+            {
+                if (presets == null || presets.Length == 0)
+                {
+                    cache[profile] = Array.Empty<JA3Fingerprint>();
+                    continue;
+                }
+
+                var parsed = new JA3Fingerprint[presets.Length];
+                for (int i = 0; i < presets.Length; i++)
+                {
+                    parsed[i] = JA3FingerprintParser.Parse(presets[i]);
+                }
+
+                cache[profile] = parsed;
+            }
+
+            return cache;
+        });
+
         private static readonly Random _rnd = new();
 
         public static JA3Fingerprint GetFingerprint(BrowserJa3Profile profile, string custom = null)
@@ -37,10 +60,10 @@ namespace Moljave.Http
                 if (string.IsNullOrWhiteSpace(custom)) throw new ArgumentNullException(nameof(custom));
                 return JA3FingerprintParser.Parse(custom);
             }
-            if (!Ja3Presets.TryGetValue(profile, out var presets) || presets.Length == 0)
+            if (!s_cachedFingerprints.Value.TryGetValue(profile, out var cachedFingerprints) || cachedFingerprints.Length == 0)
                 throw new NotSupportedException($"Profile {profile} not implemented.");
-            var ja3 = presets[_rnd.Next(presets.Length)];
-            return JA3FingerprintParser.Parse(ja3);
+
+            return cachedFingerprints[_rnd.Next(cachedFingerprints.Length)];
         }
     }
 }
