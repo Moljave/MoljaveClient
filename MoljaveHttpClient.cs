@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Http;
@@ -13,10 +14,7 @@ namespace Moljave.Http
         private static readonly Version s_defaultRequestVersion = HttpVersion.Version11;
 
         private readonly MojaveHttpClientOptions _options;
-        private readonly HttpMessageInvoker _invoker;
         private readonly MojaveCookieManager _cookieManager;
-        private readonly object _fingerprintLock = new();
-        private readonly object _proxyLock = new();
         private readonly HttpRequestMessage _defaultRequest = new();
         private readonly HttpRequestHeaders _defaultRequestHeaders;
 
@@ -29,6 +27,8 @@ namespace Moljave.Http
         private Func<MojaveProxyOptions> _overrideProxyResolver;
         private MojaveProxyOptions _staticProxyOptions;
         private bool _proxyEnabled = true;
+
+        private readonly object _sessionAffinityKey;
 
         private Uri _baseAddress;
         private Version _defaultRequestVersion = s_defaultRequestVersion;
@@ -81,23 +81,19 @@ namespace Moljave.Http
             _options.CookieManager = _cookieManager;
 
             _defaultRequestHeaders = _defaultRequest.Headers;
+            _sessionAffinityKey = new object();
 
             if (_ja3FingerprintingEnabled)
             {
                 InitializeFingerprint(options.FingerprintProvider);
-                _options.FingerprintProvider = ResolveFingerprint;
             }
             else
             {
                 _fingerprintFactory = null;
                 _currentFingerprint = null;
-                _options.FingerprintProvider = null;
             }
 
             InitializeProxy(_options.ProxyResolver);
-            _options.ProxyResolver = ResolveProxy;
-
-            _invoker = new HttpMessageInvoker(_options.BuildHandlerPipeline(), disposeHandler: true);
         }
 
         public Uri BaseAddress
@@ -225,8 +221,9 @@ namespace Moljave.Http
 
             PrepareRequest(request);
             ApplyDefaultRequestOptions(request);
+            ApplySessionRequestOptions(request);
 
-            HttpResponseMessage response = await _invoker.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            HttpResponseMessage response = await GlobalHttpHandler.SendAsync(request, cancellationToken).ConfigureAwait(false);
 
             if (completionOption == HttpCompletionOption.ResponseContentRead)
             {
@@ -389,10 +386,9 @@ namespace Moljave.Http
         {
             EnsureJa3FingerprintingEnabled();
 
-            lock (_fingerprintLock)
-            {
-                _currentFingerprint = (_fingerprintFactory ?? DefaultFingerprintFactory)();
-            }
+            var factory = _fingerprintFactory ?? DefaultFingerprintFactory;
+            var fingerprint = factory() ?? DefaultFingerprintFactory();
+            Interlocked.Exchange(ref _currentFingerprint, fingerprint);
         }
 
         public void UseFingerprintProvider(Func<JA3Fingerprint> provider, bool rotateImmediately = true)
@@ -404,77 +400,64 @@ namespace Moljave.Http
                 throw new ArgumentNullException(nameof(provider));
             }
 
-            lock (_fingerprintLock)
-            {
-                _fingerprintFactory = provider;
-                _currentFingerprint = rotateImmediately ? provider() : null;
-            }
+            _fingerprintFactory = provider;
+            var fingerprint = rotateImmediately ? provider() : null;
+            Interlocked.Exchange(ref _currentFingerprint, fingerprint);
         }
 
         public void SetProxy(WebProxy proxy)
         {
-            lock (_proxyLock)
+            if (proxy == null)
             {
-                if (proxy == null)
-                {
-                    ClearConfiguredProxy();
-                    _proxyEnabled = false;
-                    return;
-                }
-
-                var options = MojaveProxyOptions.FromWebProxy(proxy);
-                if (!options.HasProxy)
-                {
-                    ClearConfiguredProxy();
-                    _overrideProxyResolver = null;
-                    _proxyEnabled = false;
-                    return;
-                }
-
-                _staticProxyOptions = options;
+                ClearConfiguredProxy();
                 _overrideProxyResolver = null;
-                _proxyEnabled = true;
+                _proxyEnabled = false;
+                return;
             }
+
+            var options = MojaveProxyOptions.FromWebProxy(proxy);
+            if (!options.HasProxy)
+            {
+                ClearConfiguredProxy();
+                _overrideProxyResolver = null;
+                _proxyEnabled = false;
+                return;
+            }
+
+            _staticProxyOptions = options;
+            _overrideProxyResolver = null;
+            _proxyEnabled = true;
         }
 
         public void ChangeProxy(WebProxy proxy)
         {
-            lock (_proxyLock)
+            if (proxy == null)
             {
-                if (proxy == null)
-                {
-                    ClearConfiguredProxy();
-                    return;
-                }
-
-                var options = MojaveProxyOptions.FromWebProxy(proxy);
-                if (!options.HasProxy)
-                {
-                    ClearConfiguredProxy();
-                    _overrideProxyResolver = null;
-                    _proxyEnabled = false;
-                    return;
-                }
-
-                _staticProxyOptions = options;
-                _overrideProxyResolver = null;
+                ClearConfiguredProxy();
+                return;
             }
+
+            var options = MojaveProxyOptions.FromWebProxy(proxy);
+            if (!options.HasProxy)
+            {
+                ClearConfiguredProxy();
+                _overrideProxyResolver = null;
+                _proxyEnabled = false;
+                return;
+            }
+
+            _staticProxyOptions = options;
+            _overrideProxyResolver = null;
         }
 
         public void DisableProxy()
         {
-            lock (_proxyLock)
-            {
-                _proxyEnabled = false;
-            }
+            _proxyEnabled = false;
         }
 
         public void EnableProxy()
         {
-            lock (_proxyLock)
-            {
-                _proxyEnabled = true;
-            }
+            _proxyEnabled = true;
         }
 
         public Task<HttpResponseMessage> SendWithoutProxyAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
@@ -500,14 +483,11 @@ namespace Moljave.Http
 
         public void SetProxyResolver(Func<MojaveProxyOptions> resolver)
         {
-            lock (_proxyLock)
+            _overrideProxyResolver = resolver;
+            ClearConfiguredProxy();
+            if (resolver != null)
             {
-                _overrideProxyResolver = resolver;
-                ClearConfiguredProxy();
-                if (resolver != null)
-                {
-                    _proxyEnabled = true;
-                }
+                _proxyEnabled = true;
             }
         }
 
@@ -518,19 +498,16 @@ namespace Moljave.Http
                 throw new ArgumentNullException(nameof(proxyOptions));
             }
 
-            lock (_proxyLock)
+            ClearConfiguredProxy();
+            _overrideProxyResolver = null;
+            if (!proxyOptions.HasProxy)
             {
-                ClearConfiguredProxy();
-                _overrideProxyResolver = null;
-                if (!proxyOptions.HasProxy)
-                {
-                    _proxyEnabled = false;
-                    return;
-                }
-
-                _staticProxyOptions = proxyOptions;
-                _proxyEnabled = true;
+                _proxyEnabled = false;
+                return;
             }
+
+            _staticProxyOptions = proxyOptions;
+            _proxyEnabled = true;
         }
 
         public void ClearAllCookies() => _cookieManager.ClearAll();
@@ -547,7 +524,7 @@ namespace Moljave.Http
             }
 
             _disposed = true;
-            _invoker.Dispose();
+            GlobalHttpHandler.ClearSessionConnections(_sessionAffinityKey);
             _defaultRequest.Dispose();
         }
 
@@ -610,9 +587,50 @@ namespace Moljave.Http
                 options.Timeout ??= _options.DefaultTimeout;
                 options.AllowAutoRedirect ??= _options.AllowAutoRedirect;
                 options.MaxAutomaticRedirections ??= _options.MaxAutomaticRedirections;
-                options.CookieManager ??= _options.CookieManager;
+                options.CookieManager ??= _cookieManager;
                 options.MaxConnectionRetries ??= _options.MaxConnectionRetries;
                 options.RetryDelay ??= _options.ConnectionRetryDelay;
+                options.ForceCloseConnectionsAfterRequest ??= _options.ForceCloseConnectionsAfterRequest;
+                options.SocketBufferSize ??= _options.SocketBufferSize;
+                options.MaxConnectionsPerHost ??= _options.MaxConnectionsPerHost;
+            });
+        }
+
+        private void ApplySessionRequestOptions(HttpRequestMessage request)
+        {
+            request.ConfigureMojaveOptions(options =>
+            {
+                options.SessionAffinityKey ??= _sessionAffinityKey;
+                options.CookieManager ??= _cookieManager;
+                options.TlsSettings ??= _options.TlsSettingsProvider?.Invoke() ?? MojaveTlsSettings.Default;
+
+                if (_ja3FingerprintingEnabled)
+                {
+                    options.Fingerprint ??= GetOrCreateFingerprint();
+                }
+                else
+                {
+                    options.Fingerprint = null;
+                }
+
+                if (!_proxyEnabled)
+                {
+                    options.Proxy = MojaveProxyOptions.NoProxy;
+                    options.ProxySelector = _ => MojaveProxyOptions.NoProxy;
+                }
+                else
+                {
+                    var (initialProxy, selector) = ResolveProxyConfiguration();
+                    if (options.Proxy == null)
+                    {
+                        options.Proxy = initialProxy;
+                    }
+
+                    if (selector != null)
+                    {
+                        options.ProxySelector ??= selector;
+                    }
+                }
             });
         }
 
@@ -667,36 +685,10 @@ namespace Moljave.Http
 
         private void InitializeProxy(Func<MojaveProxyOptions> proxyResolver)
         {
-            lock (_proxyLock)
-            {
-                _defaultProxyResolver = proxyResolver ?? (() => MojaveProxyOptions.NoProxy);
-                _overrideProxyResolver = null;
-                _staticProxyOptions = null;
-                _proxyEnabled = true;
-            }
-        }
-
-        private MojaveProxyOptions ResolveProxy()
-        {
-            lock (_proxyLock)
-            {
-                if (!_proxyEnabled)
-                {
-                    return MojaveProxyOptions.NoProxy;
-                }
-
-                if (_overrideProxyResolver != null)
-                {
-                    return InvokeResolver(_overrideProxyResolver);
-                }
-
-                if (_staticProxyOptions != null)
-                {
-                    return _staticProxyOptions;
-                }
-
-                return InvokeResolver(_defaultProxyResolver);
-            }
+            _defaultProxyResolver = proxyResolver ?? (() => MojaveProxyOptions.NoProxy);
+            _overrideProxyResolver = null;
+            _staticProxyOptions = null;
+            _proxyEnabled = true;
         }
 
         private static MojaveProxyOptions InvokeResolver(Func<MojaveProxyOptions> resolver)
@@ -724,15 +716,6 @@ namespace Moljave.Http
             _staticProxyOptions = null;
         }
 
-        private void InitializeFingerprint(Func<JA3Fingerprint> fingerprintProvider)
-        {
-            lock (_fingerprintLock)
-            {
-                _fingerprintFactory = fingerprintProvider ?? DefaultFingerprintFactory;
-                _currentFingerprint = null;
-            }
-        }
-
         private void EnsureJa3FingerprintingEnabled()
         {
             if (!_ja3FingerprintingEnabled)
@@ -741,13 +724,56 @@ namespace Moljave.Http
             }
         }
 
-        private JA3Fingerprint ResolveFingerprint()
+        private JA3Fingerprint GetOrCreateFingerprint()
         {
-            lock (_fingerprintLock)
+            var fingerprint = Volatile.Read(ref _currentFingerprint);
+            if (fingerprint != null)
             {
-                _currentFingerprint ??= (_fingerprintFactory ?? DefaultFingerprintFactory)();
-                return _currentFingerprint;
+                return fingerprint;
             }
+
+            var factory = _fingerprintFactory ?? DefaultFingerprintFactory;
+            var generated = factory() ?? DefaultFingerprintFactory();
+            var existing = Interlocked.CompareExchange(ref _currentFingerprint, generated, null);
+            return existing ?? generated;
+        }
+
+        private (MojaveProxyOptions initialProxy, Func<int, MojaveProxyOptions> selector) ResolveProxyConfiguration()
+        {
+            if (!_proxyEnabled)
+            {
+                return (MojaveProxyOptions.NoProxy, _ => MojaveProxyOptions.NoProxy);
+            }
+
+            if (_staticProxyOptions != null)
+            {
+                var proxy = _staticProxyOptions;
+                return (proxy, _ => proxy);
+            }
+
+            var resolver = _overrideProxyResolver ?? _defaultProxyResolver;
+            if (resolver == null)
+            {
+                return (MojaveProxyOptions.NoProxy, _ => MojaveProxyOptions.NoProxy);
+            }
+
+            var cache = new ConcurrentDictionary<int, MojaveProxyOptions>();
+
+            MojaveProxyOptions Resolve()
+            {
+                return InvokeResolver(resolver) ?? MojaveProxyOptions.NoProxy;
+            }
+
+            var initial = Resolve();
+            cache[0] = initial;
+
+            return (initial, attempt => cache.GetOrAdd(attempt, _ => Resolve()));
+        }
+
+        private void InitializeFingerprint(Func<JA3Fingerprint> fingerprintProvider)
+        {
+            _fingerprintFactory = fingerprintProvider ?? DefaultFingerprintFactory;
+            Interlocked.Exchange(ref _currentFingerprint, null);
         }
 
         private static MojaveHttpClientOptions BuildOptions(Action<MojaveHttpClientOptions> configure)

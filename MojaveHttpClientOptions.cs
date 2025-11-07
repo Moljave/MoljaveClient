@@ -245,6 +245,7 @@ namespace Moljave.Http
         public JA3Fingerprint Fingerprint { get; set; }
         public MojaveTlsSettings TlsSettings { get; set; }
         public MojaveProxyOptions Proxy { get; set; }
+        public Func<int, MojaveProxyOptions> ProxySelector { get; set; }
         public TimeSpan? Timeout { get; set; }
         public bool? AllowAutoRedirect { get; set; }
         public int? MaxAutomaticRedirections { get; set; }
@@ -252,19 +253,26 @@ namespace Moljave.Http
         public int? MaxConnectionRetries { get; set; }
         public TimeSpan? RetryDelay { get; set; }
         public bool? ForceCloseConnectionsAfterRequest { get; set; }
+        public int? MaxConnectionsPerHost { get; set; }
+        public int? SocketBufferSize { get; set; }
+        public object SessionAffinityKey { get; set; }
 
         internal MojaveRequestOptions Clone() => new()
         {
             Fingerprint = Fingerprint,
             TlsSettings = TlsSettings,
             Proxy = Proxy,
+            ProxySelector = ProxySelector,
             Timeout = Timeout,
             AllowAutoRedirect = AllowAutoRedirect,
             MaxAutomaticRedirections = MaxAutomaticRedirections,
             CookieManager = CookieManager,
             MaxConnectionRetries = MaxConnectionRetries,
             RetryDelay = RetryDelay,
-            ForceCloseConnectionsAfterRequest = ForceCloseConnectionsAfterRequest
+            ForceCloseConnectionsAfterRequest = ForceCloseConnectionsAfterRequest,
+            MaxConnectionsPerHost = MaxConnectionsPerHost,
+            SocketBufferSize = SocketBufferSize,
+            SessionAffinityKey = SessionAffinityKey
         };
     }
 

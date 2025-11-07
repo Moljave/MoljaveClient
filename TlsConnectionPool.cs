@@ -11,14 +11,13 @@ namespace Moljave.Http
 {
     internal sealed class TlsConnectionPool
     {
-        private static readonly Lazy<TlsConnectionPool> _lazy = new(() => new TlsConnectionPool());
         private static readonly Timer _cleanupTimer;
         private static readonly TimeSpan CleanupInterval = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan ConnectionIdleTimeout = TimeSpan.FromSeconds(10);
 
         private readonly ConcurrentDictionary<PoolKey, PoolState> _states = new();
 
-        public static TlsConnectionPool Shared => _lazy.Value;
+        public static TlsConnectionPool Shared { get; } = new TlsConnectionPool();
 
         static TlsConnectionPool()
         {
@@ -191,6 +190,32 @@ namespace Moljave.Http
             }
         }
 
+        public void ClearConnectionsForSession(object affinityKey)
+        {
+            if (affinityKey == null)
+            {
+                return;
+            }
+
+            foreach (var kvp in _states)
+            {
+                var key = kvp.Key;
+                if (!ReferenceEquals(key.AffinityKey, affinityKey))
+                {
+                    continue;
+                }
+
+                if (_states.TryRemove(key, out var state))
+                {
+                    state.ClearQueue();
+                }
+                else if (_states.TryGetValue(key, out var existing))
+                {
+                    existing.ClearQueue();
+                }
+            }
+        }
+
         private static PoolKey CreatePoolKey(
             string host,
             int port,
@@ -287,12 +312,7 @@ namespace Moljave.Http
 
         private static void Cleanup(object state)
         {
-            if (!_lazy.IsValueCreated)
-            {
-                return;
-            }
-
-            _lazy.Value.CleanupExpiredConnections();
+            Shared.CleanupExpiredConnections();
         }
 
         private void CleanupExpiredConnections()

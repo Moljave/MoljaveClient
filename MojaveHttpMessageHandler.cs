@@ -38,7 +38,6 @@ namespace Moljave.Http
 
             var currentRequest = request;
             var currentRedirectCount = redirectCount;
-            ProxyRotationContext proxyContext = null;
 
             while (true)
             {
@@ -46,7 +45,6 @@ namespace Moljave.Http
                 var useTls = string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase);
 
                 var requestOptions = currentRequest.GetMojaveOptions();
-                proxyContext ??= CreateProxyContext(requestOptions);
                 var effectiveTimeout = requestOptions?.Timeout ?? _options.DefaultTimeout;
                 var maxRedirects = requestOptions?.MaxAutomaticRedirections ?? _options.MaxAutomaticRedirections;
                 var cookieManager = requestOptions?.CookieManager ?? _options.CookieManager;
@@ -55,6 +53,9 @@ namespace Moljave.Http
                 var maxRetries = Math.Max(0, requestOptions?.MaxConnectionRetries ?? _options.MaxConnectionRetries);
                 var retryDelay = requestOptions?.RetryDelay ?? _options.ConnectionRetryDelay;
                 var forceCloseConnections = (requestOptions?.ForceCloseConnectionsAfterRequest ?? false) || _options.ForceCloseConnectionsAfterRequest;
+                var socketBufferSize = requestOptions?.SocketBufferSize ?? _options.SocketBufferSize;
+                var maxConnectionsPerHost = requestOptions?.MaxConnectionsPerHost ?? _options.MaxConnectionsPerHost;
+                var affinityKey = forceCloseConnections ? null : requestOptions?.SessionAffinityKey ?? cookieManager;
                 if (retryDelay < TimeSpan.Zero)
                 {
                     retryDelay = TimeSpan.Zero;
@@ -85,9 +86,11 @@ namespace Moljave.Http
                     }
                 }
 
-                HttpResponseMessage response = ShouldUseHttp2(currentRequest)
-                    ? await SendHttp2Async(currentRequest, uri, effectiveTimeout, fingerprint, tlsSettings, proxyContext, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false)
-                    : await SendHttp11Async(currentRequest, uri, useTls, effectiveTimeout, fingerprint, tlsSettings, proxyContext, cookieManager, maxRetries, retryDelay, forceCloseConnections, cancellationToken).ConfigureAwait(false);
+                var initialProxy = GetProxyForAttempt(requestOptions, 0);
+
+                HttpResponseMessage response = ShouldUseHttp2(currentRequest, initialProxy)
+                    ? await SendHttp2Async(currentRequest, uri, effectiveTimeout, fingerprint, tlsSettings, requestOptions, initialProxy, maxRetries, retryDelay, cancellationToken).ConfigureAwait(false)
+                    : await SendHttp11Async(currentRequest, uri, useTls, effectiveTimeout, fingerprint, tlsSettings, requestOptions, cookieManager, affinityKey, socketBufferSize, maxConnectionsPerHost, initialProxy, maxRetries, retryDelay, forceCloseConnections, cancellationToken).ConfigureAwait(false);
 
                 if (cookieManager != null && response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
                 {
@@ -95,7 +98,7 @@ namespace Moljave.Http
                 }
 
                 var redirectOptions = currentRequest.GetMojaveOptions();
-                var allowRedirect = (redirectOptions?.AllowAutoRedirect ?? requestOptions?.AllowAutoRedirect ?? _options.AllowAutoRedirect);
+                var allowRedirect = redirectOptions?.AllowAutoRedirect ?? requestOptions?.AllowAutoRedirect ?? _options.AllowAutoRedirect;
 
                 if (!allowRedirect || !IsRedirect(response.StatusCode))
                 {
@@ -133,17 +136,6 @@ namespace Moljave.Http
             }
         }
 
-        private ProxyRotationContext CreateProxyContext(MojaveRequestOptions requestOptions)
-        {
-            if (requestOptions?.Proxy != null)
-            {
-                return ProxyRotationContext.FromOverride(requestOptions.Proxy);
-            }
-
-            var resolver = _options.ProxyResolver ?? (() => MojaveProxyOptions.NoProxy);
-            return ProxyRotationContext.FromResolver(resolver);
-        }
-
         private JA3Fingerprint GetEffectiveFingerprint(MojaveRequestOptions requestOptions)
         {
             if (!_options.EnableJa3Fingerprinting)
@@ -159,6 +151,43 @@ namespace Moljave.Http
             return _options.FingerprintProvider?.Invoke() ?? JA3Fingerprint.Default;
         }
 
+        private static MojaveProxyOptions GetProxyForAttempt(MojaveRequestOptions options, int attempt)
+            => GetProxyForAttempt(options, attempt, options?.Proxy);
+
+        private static MojaveProxyOptions GetProxyForAttempt(MojaveRequestOptions options, int attempt, MojaveProxyOptions initialProxy)
+        {
+            if (options == null)
+            {
+                return MojaveProxyOptions.NoProxy;
+            }
+
+            if (attempt == 0)
+            {
+                var proxy = initialProxy ?? options.Proxy;
+                if (proxy != null)
+                {
+                    return proxy;
+                }
+            }
+
+            var selector = options.ProxySelector;
+            if (selector != null)
+            {
+                var resolved = selector(attempt);
+                if (resolved != null)
+                {
+                    if (attempt == 0 && options.Proxy == null)
+                    {
+                        options.Proxy = resolved;
+                    }
+
+                    return resolved;
+                }
+            }
+
+            return options.Proxy ?? MojaveProxyOptions.NoProxy;
+        }
+
         private static bool IsRedirect(HttpStatusCode statusCode)
         {
             return statusCode == HttpStatusCode.Moved ||
@@ -168,14 +197,25 @@ namespace Moljave.Http
                    (int)statusCode == 308;
         }
 
-        private static bool ShouldUseHttp2(HttpRequestMessage request)
+        private static bool ShouldUseHttp2(HttpRequestMessage request, MojaveProxyOptions proxyOptions)
         {
             if (request?.Version == null)
             {
                 return false;
             }
 
-            return request.Version.Major >= 2;
+            if (request.Version.Major < 2)
+            {
+                return false;
+            }
+
+            var descriptor = proxyOptions?.Descriptor;
+            if (descriptor == null)
+            {
+                return true;
+            }
+
+            return descriptor.Scheme is ProxyScheme.Http or ProxyScheme.Https;
         }
 
         private async Task<HttpResponseMessage> SendHttp11Async(
@@ -185,8 +225,12 @@ namespace Moljave.Http
             TimeSpan timeout,
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings,
-            ProxyRotationContext proxyContext,
+            MojaveRequestOptions requestOptions,
             MojaveCookieManager cookieManager,
+            object affinityKey,
+            int socketBufferSize,
+            int maxConnectionsPerHost,
+            MojaveProxyOptions initialProxy,
             int maxRetries,
             TimeSpan retryDelay,
             bool forceCloseConnections,
@@ -201,10 +245,7 @@ namespace Moljave.Http
 
             for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
-                var proxyOptions = proxyContext?.GetProxyForAttempt(attempt) ?? MojaveProxyOptions.NoProxy;
-                var socketBufferSize = _options.SocketBufferSize;
-                var maxConnectionsPerHost = _options.MaxConnectionsPerHost;
-                var affinityKey = GetConnectionAffinityKey(cookieManager, forceCloseConnections);
+                var proxyOptions = GetProxyForAttempt(requestOptions, attempt, initialProxy);
                 TlsClientLease lease = null;
                 CancellationTokenSource waitCts = null;
                 CancellationTokenSource linkedCts = null;
@@ -225,7 +266,7 @@ namespace Moljave.Http
                         useTls,
                         fingerprint,
                         tlsSettings,
-                        proxyOptions.Descriptor,
+                        proxyOptions?.Descriptor,
                         affinityKey,
                         _options.CertificateValidationCallback,
                         maxConnectionsPerHost,
@@ -259,21 +300,21 @@ namespace Moljave.Http
                         lease.MarkReusable();
                     }
 
-                    proxyContext?.NotifySuccess(proxyOptions);
+                    proxyOptions?.RotationListener?.OnSuccess(proxyOptions);
                     return response;
                 }
                 catch (OperationCanceledException) when (linkedCts != null && linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
                     lease?.MarkUnusable();
                     var timeoutException = new TimeoutException("The HTTP/1.1 request timed out.");
-                    proxyContext?.NotifyFailure(proxyOptions, timeoutException);
+                    proxyOptions?.RotationListener?.OnFailure(proxyOptions, timeoutException);
                     throw timeoutException;
                 }
                 catch (OperationCanceledException) when (waitCts != null && waitCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
                     lease?.MarkUnusable();
                     var timeoutException = new TimeoutException("The HTTP/1.1 connection attempt timed out.");
-                    proxyContext?.NotifyFailure(proxyOptions, timeoutException);
+                    proxyOptions?.RotationListener?.OnFailure(proxyOptions, timeoutException);
                     throw timeoutException;
                 }
                 catch (Exception ex)
@@ -289,11 +330,17 @@ namespace Moljave.Http
                         tlsSettings,
                         proxyOptions,
                         cookieManager,
+                        affinityKey,
                         socketBufferSize,
                         maxConnectionsPerHost,
                         forceCloseConnections);
 
                     forceCloseConnections = _options.ForceCloseConnectionsAfterRequest || forceCloseConnections;
+                    if (forceCloseConnections)
+                    {
+                        affinityKey = null;
+                    }
+
                     if (forceCloseConnections && request.Headers.ConnectionClose != true)
                     {
                         request.Headers.ConnectionClose = true;
@@ -313,13 +360,13 @@ namespace Moljave.Http
                     if (attempt < maxRetries && ShouldRetry(transformed, proxyOptions))
                     {
                         lastException = transformed;
-                        proxyContext?.NotifyFailure(proxyOptions, transformed);
+                        proxyOptions?.RotationListener?.OnFailure(proxyOptions, transformed);
                         await DelayForRetryAsync(attempt, retryDelay, transformed, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
                     lastException = transformed;
-                    proxyContext?.NotifyFailure(proxyOptions, transformed);
+                    proxyOptions?.RotationListener?.OnFailure(proxyOptions, transformed);
                     throw transformed;
                 }
                 finally
@@ -339,7 +386,8 @@ namespace Moljave.Http
             TimeSpan timeout,
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings,
-            ProxyRotationContext proxyContext,
+            MojaveRequestOptions requestOptions,
+            MojaveProxyOptions initialProxy,
             int maxRetries,
             TimeSpan retryDelay,
             CancellationToken cancellationToken)
@@ -348,7 +396,7 @@ namespace Moljave.Http
 
             for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
-                var proxyOptions = proxyContext?.GetProxyForAttempt(attempt) ?? MojaveProxyOptions.NoProxy;
+                var proxyOptions = GetProxyForAttempt(requestOptions, attempt, initialProxy);
                 using var handler = CreateHttp2Handler(uri, fingerprint, tlsSettings, proxyOptions);
                 ApplyHttp2ConnectTimeout(handler, timeout);
 
@@ -387,14 +435,14 @@ namespace Moljave.Http
                         }
 
                         finalResponse.Content = HttpContentUtilities.CreateContent(bodyBytes, contentHeaders, out _);
-                        proxyContext?.NotifySuccess(proxyOptions);
+                        proxyOptions?.RotationListener?.OnSuccess(proxyOptions);
                         return finalResponse;
                     }
                 }
                 catch (OperationCanceledException) when (linkedCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
                     var timeoutException = new TimeoutException("The HTTP/2 request timed out.");
-                    proxyContext?.NotifyFailure(proxyOptions, timeoutException);
+                    proxyOptions?.RotationListener?.OnFailure(proxyOptions, timeoutException);
                     throw timeoutException;
                 }
                 catch (AuthenticationException ex)
@@ -406,10 +454,10 @@ namespace Moljave.Http
                         continue;
                     }
 
-                    if (proxyOptions.Descriptor == null)
+                    if (proxyOptions?.Descriptor == null)
                     {
                         lastException = ex;
-                        proxyContext?.NotifyFailure(proxyOptions, ex);
+                        proxyOptions?.RotationListener?.OnFailure(proxyOptions, ex);
                         throw;
                     }
 
@@ -421,12 +469,12 @@ namespace Moljave.Http
                     if (attempt < maxRetries && IsRetryableProxyError(proxyException))
                     {
                         lastException = proxyException;
-                        proxyContext?.NotifyFailure(proxyOptions, proxyException);
+                        proxyOptions?.RotationListener?.OnFailure(proxyOptions, proxyException);
                         await DelayForRetryAsync(attempt, retryDelay, proxyException, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
-                    proxyContext?.NotifyFailure(proxyOptions, proxyException);
+                    proxyOptions?.RotationListener?.OnFailure(proxyOptions, proxyException);
                     throw proxyException;
                 }
                 catch (HttpRequestException ex)
@@ -445,23 +493,23 @@ namespace Moljave.Http
                     {
                         if (attempt < maxRetries && IsRetryableProxyError(proxyException))
                         {
-                            proxyContext?.NotifyFailure(proxyOptions, proxyException);
+                            proxyOptions?.RotationListener?.OnFailure(proxyOptions, proxyException);
                             await DelayForRetryAsync(attempt, retryDelay, proxyException, cancellationToken).ConfigureAwait(false);
                             continue;
                         }
 
-                        proxyContext?.NotifyFailure(proxyOptions, proxyException);
+                        proxyOptions?.RotationListener?.OnFailure(proxyOptions, proxyException);
                         throw proxyException;
                     }
 
                     if (attempt < maxRetries && ShouldRetry(transformed, proxyOptions))
                     {
-                        proxyContext?.NotifyFailure(proxyOptions, transformed);
+                        proxyOptions?.RotationListener?.OnFailure(proxyOptions, transformed);
                         await DelayForRetryAsync(attempt, retryDelay, transformed, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
-                    proxyContext?.NotifyFailure(proxyOptions, transformed);
+                    proxyOptions?.RotationListener?.OnFailure(proxyOptions, transformed);
                     throw transformed;
                 }
                 catch (Exception ex)
@@ -478,13 +526,13 @@ namespace Moljave.Http
                     if (attempt < maxRetries && ShouldRetry(transformed, proxyOptions))
                     {
                         lastException = transformed;
-                        proxyContext?.NotifyFailure(proxyOptions, transformed);
+                        proxyOptions?.RotationListener?.OnFailure(proxyOptions, transformed);
                         await DelayForRetryAsync(attempt, retryDelay, transformed, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
                     lastException = transformed;
-                    proxyContext?.NotifyFailure(proxyOptions, transformed);
+                    proxyOptions?.RotationListener?.OnFailure(proxyOptions, transformed);
                     throw transformed;
                 }
             }
@@ -771,16 +819,6 @@ namespace Moljave.Http
             }
         }
 
-        private object GetConnectionAffinityKey(MojaveCookieManager cookieManager, bool forceCloseConnections)
-        {
-            if (forceCloseConnections)
-            {
-                return null;
-            }
-
-            return cookieManager;
-        }
-
         private static async Task DelayForRetryAsync(
             int attempt,
             TimeSpan baseDelay,
@@ -822,6 +860,7 @@ namespace Moljave.Http
             MojaveTlsSettings tlsSettings,
             MojaveProxyOptions proxyOptions,
             MojaveCookieManager cookieManager,
+            object affinityKey,
             int socketBufferSize,
             int maxConnectionsPerHost,
             bool forceCloseConnections)
@@ -844,6 +883,7 @@ namespace Moljave.Http
                         tlsSettings,
                         proxyOptions,
                         cookieManager,
+                        affinityKey,
                         forceCloseConnections,
                         "The operating system ran out of socket buffer space while communicating with ",
                         "Reduce concurrent connections or lower MojaveHttpClientOptions.SocketBufferSize to avoid exhausting kernel buffers.",
@@ -854,6 +894,7 @@ namespace Moljave.Http
                     if (forceCloseActivated)
                     {
                         forceCloseConnections = true;
+                        affinityKey = null;
                         if (uri != null)
                         {
                             TlsConnectionPool.Shared.ClearHostVariants(uri.Host, port, useTls);
@@ -868,7 +909,7 @@ namespace Moljave.Http
                             fingerprint,
                             tlsSettings,
                             proxyOptions,
-                            cookieManager,
+                            affinityKey,
                             socketBufferSize,
                             socketBufferReduced,
                             forceCloseConnections);
@@ -884,6 +925,7 @@ namespace Moljave.Http
                         tlsSettings,
                         proxyOptions,
                         cookieManager,
+                        affinityKey,
                         forceCloseConnections,
                         "The operating system refused to open a new socket because the local port range is exhausted while communicating with ",
                         "Reduce concurrent connections or lower MojaveHttpClientOptions.MaxConnectionsPerHost to avoid running out of ephemeral ports.",
@@ -892,6 +934,7 @@ namespace Moljave.Http
                     if (forceCloseEnabled)
                     {
                         forceCloseConnections = true;
+                        affinityKey = null;
                         if (uri != null)
                         {
                             TlsConnectionPool.Shared.ClearHostVariants(uri.Host, port, useTls);
@@ -906,7 +949,7 @@ namespace Moljave.Http
                             fingerprint,
                             tlsSettings,
                             proxyOptions,
-                            cookieManager,
+                            affinityKey,
                             socketBufferSize,
                             socketBufferReduced: false,
                             forceCloseConnections);
@@ -916,7 +959,6 @@ namespace Moljave.Http
                     return exception;
             }
         }
-
         private HttpRequestException CreateSocketResourceException(
             SocketException socketException,
             Uri uri,
@@ -926,11 +968,14 @@ namespace Moljave.Http
             MojaveTlsSettings tlsSettings,
             MojaveProxyOptions proxyOptions,
             MojaveCookieManager cookieManager,
+            object affinityKey,
             bool forceCloseConnections,
             string prefixMessage,
             string mitigationMessage,
             int socketBufferSize)
         {
+            var effectiveAffinity = forceCloseConnections ? null : affinityKey;
+
             TlsConnectionPool.Shared.Clear(
                 uri?.Host,
                 port,
@@ -938,7 +983,7 @@ namespace Moljave.Http
                 fingerprint,
                 tlsSettings,
                 proxyOptions?.Descriptor,
-                GetConnectionAffinityKey(cookieManager, forceCloseConnections),
+                effectiveAffinity,
                 socketBufferSize);
 
             var messageBuilder = new StringBuilder();
@@ -950,7 +995,6 @@ namespace Moljave.Http
 
             return new HttpRequestException(messageBuilder.ToString(), socketException);
         }
-
         private void ReducePoolMaxConnections(
             Uri uri,
             int port,
@@ -958,7 +1002,7 @@ namespace Moljave.Http
             JA3Fingerprint fingerprint,
             MojaveTlsSettings tlsSettings,
             MojaveProxyOptions proxyOptions,
-            MojaveCookieManager cookieManager,
+            object affinityKey,
             int observedSocketBufferSize,
             bool socketBufferReduced,
             bool forceCloseConnections)
@@ -969,7 +1013,7 @@ namespace Moljave.Http
             }
 
             var descriptor = proxyOptions?.Descriptor;
-            var affinityKey = GetConnectionAffinityKey(cookieManager, forceCloseConnections);
+            var effectiveAffinity = forceCloseConnections ? null : affinityKey;
             var maxConnections = _options.MaxConnectionsPerHost;
 
             TlsConnectionPool.Shared.AdjustMaxConnections(
@@ -979,7 +1023,7 @@ namespace Moljave.Http
                 fingerprint,
                 tlsSettings,
                 descriptor,
-                affinityKey,
+                effectiveAffinity,
                 observedSocketBufferSize,
                 maxConnections);
 
@@ -1001,7 +1045,7 @@ namespace Moljave.Http
                 fingerprint,
                 tlsSettings,
                 descriptor,
-                affinityKey,
+                effectiveAffinity,
                 newSocketBufferSize,
                 maxConnections);
         }
