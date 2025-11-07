@@ -65,18 +65,17 @@ namespace Moljave.Http
 
             try
             {
-                while (state.Queue.TryDequeue(out var existing))
+                while (state.TryTakeClient(out var pooledClient))
                 {
-                    var client = existing.Client;
-                    if (client != null && client.IsReusable)
+                    if (pooledClient != null && pooledClient.IsReusable)
                     {
-                        return new TlsClientLease(this, state, client);
+                        return new TlsClientLease(this, state, pooledClient);
                     }
 
-                    client?.Dispose();
+                    pooledClient?.Dispose();
                 }
 
-                var client = new TlsClient(
+                var newClient = new TlsClient(
                     host,
                     port,
                     fingerprint,
@@ -85,7 +84,7 @@ namespace Moljave.Http
                     certificateValidationCallback,
                     socketBufferSize);
 
-                return new TlsClientLease(this, state, client);
+                return new TlsClientLease(this, state, newClient);
             }
             catch
             {
@@ -344,7 +343,17 @@ namespace Moljave.Http
             private int _maxConnections;
             private int _reservedPermits;
 
-            public ConcurrentQueue<PooledConnection> Queue => _queue;
+            public bool TryTakeClient(out TlsClient client)
+            {
+                while (_queue.TryDequeue(out var connection))
+                {
+                    client = connection.Client;
+                    return true;
+                }
+
+                client = null;
+                return false;
+            }
 
             public SemaphoreSlim GetSemaphore(int maxConnections)
             {

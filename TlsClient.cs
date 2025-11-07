@@ -82,8 +82,10 @@ namespace Moljave.Http
             var headerResult = await ReadHeadersAsync(activeStream, cancellationToken).ConfigureAwait(false);
             try
             {
-                var headerSpan = headerResult.HeaderBuffer.AsSpan(0, headerResult.HeaderLength);
-                ParseBodyMetadata(headerSpan,
+                var headerBuffer = headerResult.HeaderBuffer;
+                var headerLength = headerResult.HeaderLength;
+
+                ParseBodyMetadata(headerBuffer.AsSpan(0, headerLength),
                     out bool hasContentLength,
                     out int contentLength,
                     out bool isChunked);
@@ -104,7 +106,7 @@ namespace Moljave.Http
                     await ReadUntilEndAsync(responseStream, bodyWriter, cancellationToken).ConfigureAwait(false);
                 }
 
-                return HttpResponseParser.Parse(headerSpan, bodyWriter.WrittenMemory);
+                return HttpResponseParser.Parse(headerBuffer.AsSpan(0, headerLength), bodyWriter.WrittenMemory);
             }
             finally
             {
