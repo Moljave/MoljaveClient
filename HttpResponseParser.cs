@@ -3,29 +3,19 @@ using System.Buffers.Text;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace Moljave.Http
 {
     public static class HttpResponseParser
     {
-        public static HttpResponseMessage Parse(byte[] responseBytes)
+        public static HttpResponseMessage Parse(ReadOnlySpan<byte> headerSpan, ReadOnlyMemory<byte> bodyMemory)
         {
-            if (responseBytes == null || responseBytes.Length == 0)
+            if (headerSpan.IsEmpty)
             {
-                throw new ArgumentException("Response bytes cannot be null or empty.", nameof(responseBytes));
+                throw new ArgumentException("Response header cannot be empty.", nameof(headerSpan));
             }
-
-            var separator = FindHeaderBodySeparator(responseBytes);
-            if (separator < 0)
-            {
-                throw new InvalidOperationException("Failed to locate HTTP header terminator.");
-            }
-
-            var headerSpan = responseBytes.AsSpan(0, separator);
-            var bodyLength = responseBytes.Length - separator;
-            var bodyBytes = new byte[bodyLength];
-            Buffer.BlockCopy(responseBytes, separator, bodyBytes, 0, bodyLength);
 
             var statusLineEnd = headerSpan.IndexOf((byte)'\n');
             if (statusLineEnd < 0)
@@ -84,22 +74,8 @@ namespace Moljave.Http
                 }
             }
 
-            response.Content = HttpContentUtilities.CreateContent(bodyBytes, contentHeaders, out _);
+            response.Content = HttpContentUtilities.CreateContent(bodyMemory, contentHeaders, out _);
             return response;
-        }
-
-        private static int FindHeaderBodySeparator(byte[] responseBytes)
-        {
-            for (int i = 0; i < responseBytes.Length - 3; i++)
-            {
-                if (responseBytes[i] == 13 && responseBytes[i + 1] == 10 &&
-                    responseBytes[i + 2] == 13 && responseBytes[i + 3] == 10)
-                {
-                    return i + 4;
-                }
-            }
-
-            return -1;
         }
 
         private static HttpResponseMessage ParseStatusLine(ReadOnlySpan<byte> statusLine)

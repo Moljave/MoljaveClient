@@ -4,18 +4,22 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 
 namespace Moljave.Http
 {
     internal static class HttpContentUtilities
     {
         public static ByteArrayContent CreateContent(
-            byte[] body,
+            ReadOnlyMemory<byte> body,
             IList<KeyValuePair<string, string>> headers,
             out bool wasDecompressed)
         {
             var payload = DecodeBody(body, headers, out wasDecompressed);
-            var content = new ByteArrayContent(payload);
+            var array = payload.Array ?? Array.Empty<byte>();
+            var offset = payload.Offset;
+            var count = payload.Count;
+            var content = new ByteArrayContent(array, offset, count);
 
             if (headers != null)
             {
@@ -35,17 +39,17 @@ namespace Moljave.Http
                 }
             }
 
-            content.Headers.ContentLength = payload.LongLength;
+            content.Headers.ContentLength = count;
             return content;
         }
 
-        private static byte[] DecodeBody(byte[] body, IList<KeyValuePair<string, string>> headers, out bool wasDecompressed)
+        private static ArraySegment<byte> DecodeBody(ReadOnlyMemory<byte> body, IList<KeyValuePair<string, string>> headers, out bool wasDecompressed)
         {
             wasDecompressed = false;
 
-            if (body == null || body.Length == 0 || headers == null || headers.Count == 0)
+            if (body.IsEmpty || headers == null || headers.Count == 0)
             {
-                return body ?? Array.Empty<byte>();
+                return GetSegment(body);
             }
 
             var encodingHeader = headers.FirstOrDefault(h =>
@@ -53,7 +57,7 @@ namespace Moljave.Http
 
             if (string.IsNullOrEmpty(encodingHeader.Key))
             {
-                return body;
+                return GetSegment(body);
             }
 
             try
@@ -61,19 +65,19 @@ namespace Moljave.Http
                 if (encodingHeader.Value.Contains("gzip", StringComparison.OrdinalIgnoreCase))
                 {
                     wasDecompressed = true;
-                    return Decompress(body, stream => new GZipStream(stream, CompressionMode.Decompress));
+                    return CreateSegment(Decompress(body, stream => new GZipStream(stream, CompressionMode.Decompress)));
                 }
 
                 if (encodingHeader.Value.Contains("deflate", StringComparison.OrdinalIgnoreCase))
                 {
                     wasDecompressed = true;
-                    return Decompress(body, stream => new DeflateStream(stream, CompressionMode.Decompress));
+                    return CreateSegment(Decompress(body, stream => new DeflateStream(stream, CompressionMode.Decompress)));
                 }
 
                 if (encodingHeader.Value.Contains("br", StringComparison.OrdinalIgnoreCase))
                 {
                     wasDecompressed = true;
-                    return Decompress(body, stream => new BrotliStream(stream, CompressionMode.Decompress));
+                    return CreateSegment(Decompress(body, stream => new BrotliStream(stream, CompressionMode.Decompress)));
                 }
             }
             catch
@@ -81,17 +85,32 @@ namespace Moljave.Http
                 wasDecompressed = false;
             }
 
-            return body;
+            return GetSegment(body);
         }
 
-        private static byte[] Decompress(byte[] body, Func<Stream, Stream> factory)
+        private static byte[] Decompress(ReadOnlyMemory<byte> body, Func<Stream, Stream> factory)
         {
-            using var input = new MemoryStream(body);
+            var segment = GetSegment(body);
+            using var input = new MemoryStream(segment.Array, segment.Offset, segment.Count, writable: false);
             using var decompressor = factory(input);
             using var output = new MemoryStream();
             decompressor.CopyTo(output);
             return output.ToArray();
         }
+
+        private static ArraySegment<byte> GetSegment(ReadOnlyMemory<byte> body)
+        {
+            if (MemoryMarshal.TryGetArray(body, out ArraySegment<byte> segment))
+            {
+                return segment;
+            }
+
+            var copy = body.ToArray();
+            return new ArraySegment<byte>(copy, 0, copy.Length);
+        }
+
+        private static ArraySegment<byte> CreateSegment(byte[] array)
+            => array == null ? new ArraySegment<byte>(Array.Empty<byte>()) : new ArraySegment<byte>(array, 0, array.Length);
     }
 }
 

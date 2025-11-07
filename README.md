@@ -133,6 +133,19 @@ request.ConfigureMojaveOptions(o =>
 var response = await client.SendAsync(request);
 ```
 
+### 🔐 Session affinity & isolation
+
+- **Always provide a unique `SessionAffinityKey` per logical session**. When connection reuse is enabled the handler now enforces this requirement and throws if the key is missing. You can supply it per request via `MojaveRequestOptions.SessionAffinityKey` or by constructing a dedicated `MojaveHttpClient` per session (each client generates its own key).
+- Sharing a `MojaveCookieManager` across sessions is supported as long as each session uses a distinct affinity key.
+- When you intentionally disable connection reuse by setting `ForceCloseConnectionsAfterRequest`, the affinity key is optional.
+
+### ⚙️ Proactive resource planning
+
+- Configure `SocketBufferSize` and `MaxConnectionsPerHost` up front based on the capacity of your target machines. The client no longer mutates these settings in reaction to socket exhaustion, preserving predictable behaviour across sessions.
+- Prefer smaller socket buffers (for example 8–32 KB) when running thousands of concurrent connections to reduce kernel memory pressure.
+- Monitor ephemeral port usage and adjust `MaxConnectionsPerHost` before saturation instead of relying on automatic back-off.
+- If the OS reports `SocketError.NoBufferSpaceAvailable` or `SocketError.AddressAlreadyInUse`, reduce concurrency globally rather than expecting MojaveHttpClient to do so implicitly.
+
 ### 🍪 Cookie management cheatsheet
 
 ```csharp

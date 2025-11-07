@@ -6,12 +6,13 @@ using System.Net.Http;
 using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 
 namespace Moljave.Http
 {
     public static class HttpRequestStringifier
     {
-        public static async Task<byte[]> Stringify(HttpRequestMessage request)
+        public static async Task<HttpRequestPayload> Stringify(HttpRequestMessage request)
         {
             if (request == null)
             {
@@ -115,15 +116,21 @@ namespace Moljave.Http
             WriteCrlf();
 
             var headers = writer.WrittenMemory;
-            if (contentBytes.Length == 0)
+            if (!MemoryMarshal.TryGetArray(headers, out ArraySegment<byte> headerSegment))
             {
-                return headers.ToArray();
+                var headerCopy = headers.ToArray();
+                headerSegment = new ArraySegment<byte>(headerCopy, 0, headerCopy.Length);
             }
 
-            var result = new byte[headers.Length + contentBytes.Length];
-            headers.Span.CopyTo(result);
-            Buffer.BlockCopy(contentBytes, 0, result, headers.Length, contentBytes.Length);
-            return result;
+            if (contentBytes.Length == 0)
+            {
+                return new HttpRequestPayload(headerSegment.Array, headerSegment.Offset, headerSegment.Count);
+            }
+
+            var buffer = new byte[headerSegment.Count + contentBytes.Length];
+            Buffer.BlockCopy(headerSegment.Array, headerSegment.Offset, buffer, 0, headerSegment.Count);
+            Buffer.BlockCopy(contentBytes, 0, buffer, headerSegment.Count, contentBytes.Length);
+            return new HttpRequestPayload(buffer, 0, buffer.Length);
         }
 
         public static async Task<HttpRequestMessage> CloneWithRedirectAsync(
@@ -184,5 +191,31 @@ namespace Moljave.Http
             var value = versionPolicyProperty.GetValue(source);
             versionPolicyProperty.SetValue(destination, value);
         }
+    }
+
+    public readonly struct HttpRequestPayload
+    {
+        private readonly byte[] _buffer;
+        private readonly int _offset;
+        private readonly int _count;
+
+        public HttpRequestPayload(byte[] buffer, int offset, int count)
+        {
+            _buffer = buffer ?? throw new ArgumentNullException(nameof(buffer));
+            if (offset < 0 || count < 0 || buffer.Length - offset < count)
+            {
+                throw new ArgumentOutOfRangeException(nameof(count));
+            }
+
+            _offset = offset;
+            _count = count;
+        }
+
+        public bool IsEmpty => _buffer == null || _count == 0;
+
+        public int Length => _count;
+
+        public ReadOnlyMemory<byte> AsMemory()
+            => _buffer == null ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>(_buffer, _offset, _count);
     }
 }

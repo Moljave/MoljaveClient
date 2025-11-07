@@ -10,9 +10,6 @@ namespace Moljave.Http
 {
     public sealed class MojaveHttpClientOptions
     {
-        private const int MinimumSocketBufferSize = 1024;
-        private const int MinimumMaxConnectionsPerHost = 1;
-
         private long _defaultTimeoutTicks = TimeSpan.FromSeconds(30).Ticks;
         private int _allowAutoRedirect = 1;
         private int _maxAutomaticRedirections = 10;
@@ -122,93 +119,6 @@ namespace Moljave.Http
 
         public RemoteCertificateValidationCallback CertificateValidationCallback { get; set; }
             = (_, _, _, _) => true;
-
-        internal bool TryReduceSocketBufferSize(int observedValue)
-        {
-            while (true)
-            {
-                var current = Volatile.Read(ref _socketBufferSize);
-
-                if (current <= 0)
-                {
-                    return false;
-                }
-
-                if (observedValue > 0 && current < observedValue)
-                {
-                    return false;
-                }
-
-                int next;
-                if (current <= MinimumSocketBufferSize)
-                {
-                    next = 0;
-                }
-                else
-                {
-                    next = Math.Max(MinimumSocketBufferSize, current / 2);
-                    if (next == current)
-                    {
-                        next = MinimumSocketBufferSize;
-                    }
-                }
-
-                if (Interlocked.CompareExchange(ref _socketBufferSize, next, current) == current)
-                {
-                    return true;
-                }
-            }
-        }
-
-        internal bool TryReduceMaxConnectionsPerHost(int observedValue)
-        {
-            while (true)
-            {
-                var current = Volatile.Read(ref _maxConnectionsPerHost);
-
-                if (current <= MinimumMaxConnectionsPerHost)
-                {
-                    return false;
-                }
-
-                if (observedValue > 0 && current < observedValue)
-                {
-                    return false;
-                }
-
-                var next = Math.Max(MinimumMaxConnectionsPerHost, current / 2);
-                if (next == current)
-                {
-                    next = MinimumMaxConnectionsPerHost;
-                    if (next == current)
-                    {
-                        return false;
-                    }
-                }
-
-                if (Interlocked.CompareExchange(ref _maxConnectionsPerHost, next, current) == current)
-                {
-                    return true;
-                }
-            }
-        }
-
-        internal bool TryEnableForceCloseConnections()
-        {
-            while (true)
-            {
-                var current = Volatile.Read(ref _forceConnectionCloseAfterRequest);
-                if (current == 1)
-                {
-                    return false;
-                }
-
-                if (Interlocked.CompareExchange(ref _forceConnectionCloseAfterRequest, 1, current) == current)
-                {
-                    return true;
-                }
-            }
-        }
 
         internal HttpMessageHandler BuildHandlerPipeline()
         {

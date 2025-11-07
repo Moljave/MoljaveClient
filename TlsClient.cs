@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Net.Http;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
@@ -63,48 +64,57 @@ namespace Moljave.Http
             }
         }
 
-        public async Task<byte[]> SendRequestAsync(byte[] requestBytes, CancellationToken cancellationToken, bool useTls)
+        public async Task<HttpResponseMessage> SendRequestAsync(ReadOnlyMemory<byte> requestBuffer, CancellationToken cancellationToken, bool useTls)
         {
             if (_disposed)
             {
                 throw new ObjectDisposedException(nameof(TlsClient));
             }
 
-            if (requestBytes == null)
-            {
-                throw new ArgumentNullException(nameof(requestBytes));
-            }
-
             var activeStream = await GetActiveStreamAsync(useTls, cancellationToken).ConfigureAwait(false);
 
-            await activeStream.WriteAsync(requestBytes, 0, requestBytes.Length, cancellationToken).ConfigureAwait(false);
+            if (!requestBuffer.IsEmpty)
+            {
+                await activeStream.WriteAsync(requestBuffer, cancellationToken).ConfigureAwait(false);
+            }
             await activeStream.FlushAsync(cancellationToken).ConfigureAwait(false);
 
-            using var memoryStream = new MemoryStream();
             var headerResult = await ReadHeadersAsync(activeStream, cancellationToken).ConfigureAwait(false);
-            memoryStream.Write(headerResult.HeaderBuffer, 0, headerResult.HeaderLength);
-
-            ParseBodyMetadata(headerResult.HeaderBuffer.AsSpan(0, headerResult.HeaderLength),
-                out bool hasContentLength,
-                out int contentLength,
-                out bool isChunked);
-
-            using var responseStream = new BufferedReadStream(activeStream, headerResult.PrefetchBuffer, headerResult.PrefetchLength);
-
-            if (isChunked)
+            try
             {
-                await ReadChunkedBodyAsync(responseStream, memoryStream, cancellationToken).ConfigureAwait(false);
-            }
-            else if (hasContentLength)
-            {
-                await ReadFixedBodyAsync(responseStream, memoryStream, contentLength, cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                await ReadUntilEndAsync(responseStream, memoryStream, cancellationToken).ConfigureAwait(false);
-            }
+                var headerSpan = headerResult.HeaderBuffer.AsSpan(0, headerResult.HeaderLength);
+                ParseBodyMetadata(headerSpan,
+                    out bool hasContentLength,
+                    out int contentLength,
+                    out bool isChunked);
 
-            return memoryStream.ToArray();
+                using var responseStream = new BufferedReadStream(activeStream, headerResult.PrefetchBuffer, headerResult.PrefetchLength);
+                var bodyWriter = new ArrayBufferWriter<byte>(GetInitialBodyBufferSize(hasContentLength ? contentLength : -1));
+
+                if (isChunked)
+                {
+                    await ReadChunkedBodyAsync(responseStream, bodyWriter, cancellationToken).ConfigureAwait(false);
+                }
+                else if (hasContentLength)
+                {
+                    await ReadFixedBodyAsync(responseStream, bodyWriter, contentLength, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await ReadUntilEndAsync(responseStream, bodyWriter, cancellationToken).ConfigureAwait(false);
+                }
+
+                return HttpResponseParser.Parse(headerSpan, bodyWriter.WrittenMemory);
+            }
+            finally
+            {
+                if (headerResult.PrefetchBuffer.Length > 0)
+                {
+                    ArrayPool<byte>.Shared.Return(headerResult.PrefetchBuffer);
+                }
+
+                ArrayPool<byte>.Shared.Return(headerResult.HeaderBuffer);
+            }
         }
 
         public async Task<Stream> CreateTransportStreamAsync(CancellationToken cancellationToken)
@@ -897,7 +907,7 @@ namespace Moljave.Http
             }
         }
 
-        private static async Task ReadChunkedBodyAsync(Stream stream, MemoryStream destination, CancellationToken cancellationToken)
+        private static async Task ReadChunkedBodyAsync(Stream stream, IBufferWriter<byte> destination, CancellationToken cancellationToken)
         {
             var buffer = ArrayPool<byte>.Shared.Rent(8192);
 
@@ -940,7 +950,7 @@ namespace Moljave.Http
                             throw new IOException("Unexpected end of stream while reading chunked body.");
                         }
 
-                        destination.Write(buffer, 0, read);
+                        WriteToBuffer(destination, buffer.AsSpan(0, read));
                         remaining -= read;
                     }
 
@@ -953,7 +963,7 @@ namespace Moljave.Http
             }
         }
 
-        private static async Task ReadFixedBodyAsync(Stream stream, MemoryStream destination, int length, CancellationToken cancellationToken)
+        private static async Task ReadFixedBodyAsync(Stream stream, IBufferWriter<byte> destination, int length, CancellationToken cancellationToken)
         {
             var buffer = ArrayPool<byte>.Shared.Rent(8192);
 
@@ -969,7 +979,7 @@ namespace Moljave.Http
                         break;
                     }
 
-                    destination.Write(buffer, 0, read);
+                    WriteToBuffer(destination, buffer.AsSpan(0, read));
                     remaining -= read;
                 }
             }
@@ -979,7 +989,7 @@ namespace Moljave.Http
             }
         }
 
-        private static async Task ReadUntilEndAsync(Stream stream, MemoryStream destination, CancellationToken cancellationToken)
+        private static async Task ReadUntilEndAsync(Stream stream, IBufferWriter<byte> destination, CancellationToken cancellationToken)
         {
             var buffer = ArrayPool<byte>.Shared.Rent(8192);
 
@@ -993,13 +1003,53 @@ namespace Moljave.Http
                         break;
                     }
 
-                    destination.Write(buffer, 0, read);
+                    WriteToBuffer(destination, buffer.AsSpan(0, read));
                 }
             }
             finally
             {
                 ArrayPool<byte>.Shared.Return(buffer);
             }
+        }
+
+        private static int GetInitialBodyBufferSize(int contentLength)
+        {
+            const int DefaultSize = 1024;
+            const int MaxInitialSize = 64 * 1024;
+
+            if (contentLength <= 0)
+            {
+                return DefaultSize;
+            }
+
+            if (contentLength < DefaultSize)
+            {
+                return DefaultSize;
+            }
+
+            if (contentLength > MaxInitialSize)
+            {
+                return MaxInitialSize;
+            }
+
+            return contentLength;
+        }
+
+        private static void WriteToBuffer(IBufferWriter<byte> writer, ReadOnlySpan<byte> source)
+        {
+            if (writer == null)
+            {
+                throw new ArgumentNullException(nameof(writer));
+            }
+
+            if (source.Length == 0)
+            {
+                return;
+            }
+
+            var span = writer.GetSpan(source.Length);
+            source.CopyTo(span);
+            writer.Advance(source.Length);
         }
 
         private static void ParseBodyMetadata(
@@ -1226,48 +1276,52 @@ namespace Moljave.Http
 
         private static async Task<HeaderReadResult> ReadHeadersAsync(Stream stream, CancellationToken cancellationToken)
         {
-            var writer = new ArrayBufferWriter<byte>(4096);
-            var buffer = ArrayPool<byte>.Shared.Rent(8192);
-
-            try
+            if (stream == null)
             {
-                while (true)
+                throw new ArgumentNullException(nameof(stream));
+            }
+
+            var headerBuffer = ArrayPool<byte>.Shared.Rent(4096);
+            var written = 0;
+
+            while (true)
+            {
+                if (written == headerBuffer.Length)
                 {
-                    var read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(false);
-                    if (read == 0)
-                    {
-                        throw new IOException("Unexpected end of stream while reading headers.");
-                    }
+                    var newBuffer = ArrayPool<byte>.Shared.Rent(headerBuffer.Length * 2);
+                    Buffer.BlockCopy(headerBuffer, 0, newBuffer, 0, written);
+                    ArrayPool<byte>.Shared.Return(headerBuffer);
+                    headerBuffer = newBuffer;
+                }
 
-                    var previousLength = writer.WrittenCount;
-                    writer.Write(buffer.AsSpan(0, read));
-                    var span = writer.WrittenSpan;
-                    var searchStart = previousLength >= 3 ? previousLength : 3;
+                var read = await stream.ReadAsync(headerBuffer.AsMemory(written, headerBuffer.Length - written), cancellationToken).ConfigureAwait(false);
+                if (read == 0)
+                {
+                    ArrayPool<byte>.Shared.Return(headerBuffer);
+                    throw new IOException("Unexpected end of stream while reading headers.");
+                }
 
-                    for (int i = searchStart; i < span.Length; i++)
+                var previous = written;
+                written += read;
+                var searchStart = previous >= 3 ? previous : 3;
+
+                for (int i = searchStart; i <= written - 4; i++)
+                {
+                    if (headerBuffer[i - 3] == 13 && headerBuffer[i - 2] == 10 && headerBuffer[i - 1] == 13 && headerBuffer[i] == 10)
                     {
-                        if (span[i - 3] == 13 && span[i - 2] == 10 && span[i - 1] == 13 && span[i] == 10)
+                        var headerLength = i + 1;
+                        var leftoverCount = written - headerLength;
+                        byte[] prefetch = Array.Empty<byte>();
+
+                        if (leftoverCount > 0)
                         {
-                            var headerLength = i + 1;
-                            var headerBuffer = new byte[headerLength];
-                            span.Slice(0, headerLength).CopyTo(headerBuffer);
-
-                            var leftoverCount = span.Length - headerLength;
-                            byte[] prefetch = Array.Empty<byte>();
-                            if (leftoverCount > 0)
-                            {
-                                prefetch = new byte[leftoverCount];
-                                span.Slice(headerLength, leftoverCount).CopyTo(prefetch);
-                            }
-
-                            return new HeaderReadResult(headerBuffer, headerLength, prefetch, leftoverCount);
+                            prefetch = ArrayPool<byte>.Shared.Rent(leftoverCount);
+                            Buffer.BlockCopy(headerBuffer, headerLength, prefetch, 0, leftoverCount);
                         }
+
+                        return new HeaderReadResult(headerBuffer, headerLength, prefetch, leftoverCount);
                     }
                 }
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
             }
         }
 
@@ -1528,6 +1582,7 @@ namespace Moljave.Http
 
                 _disposed = true;
                 ArrayPool<byte>.Shared.Return(_buffer);
+                _prefetch = Array.Empty<byte>();
             }
 
             private int ReadFromPrefetch(Span<byte> destination)
