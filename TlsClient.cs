@@ -13,6 +13,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 
 namespace Moljave.Http
 {
@@ -75,7 +76,14 @@ namespace Moljave.Http
 
             if (!requestBuffer.IsEmpty)
             {
-                await activeStream.WriteAsync(requestBuffer, cancellationToken).ConfigureAwait(false);
+                ArraySegment<byte> segment;
+                if (!MemoryMarshal.TryGetArray(requestBuffer, out segment))
+                {
+                    var copy = requestBuffer.ToArray();
+                    segment = new ArraySegment<byte>(copy, 0, copy.Length);
+                }
+
+                await activeStream.WriteAsync(segment.Array, segment.Offset, segment.Count, cancellationToken).ConfigureAwait(false);
             }
             await activeStream.FlushAsync(cancellationToken).ConfigureAwait(false);
 
