@@ -1,4 +1,6 @@
 using System;
+using System.Buffers;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
@@ -35,52 +37,92 @@ namespace Moljave.Http
                 request.Content.Headers.ContentLength = contentBytes.Length;
             }
 
-            var builder = new StringBuilder();
-            builder.Append(request.Method.Method);
-            builder.Append(' ');
-            builder.Append(target);
-            builder.Append(" HTTP/1.1\r\n");
+            var writer = new ArrayBufferWriter<byte>(512);
+
+            void WriteAscii(string value)
+            {
+                if (string.IsNullOrEmpty(value))
+                {
+                    return;
+                }
+
+                var span = writer.GetSpan(value.Length);
+                var written = Encoding.ASCII.GetBytes(value.AsSpan(), span);
+                writer.Advance(written);
+            }
+
+            void WriteCrlf()
+            {
+                var span = writer.GetSpan(2);
+                span[0] = (byte)'\r';
+                span[1] = (byte)'\n';
+                writer.Advance(2);
+            }
+
+            void WriteHeader(string name, IEnumerable<string> values)
+            {
+                if (values == null)
+                {
+                    return;
+                }
+
+                WriteAscii(name);
+                WriteAscii(": ");
+
+                bool first = true;
+                foreach (var value in values)
+                {
+                    if (!first)
+                    {
+                        WriteAscii(", ");
+                    }
+
+                    first = false;
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        WriteAscii(value);
+                    }
+                }
+
+                WriteCrlf();
+            }
+
+            WriteAscii(request.Method.Method);
+            WriteAscii(" ");
+            WriteAscii(target);
+            WriteAscii(" HTTP/1.1");
+            WriteCrlf();
 
             var hostHeader = uri.IsDefaultPort ? uri.Host : $"{uri.Host}:{uri.Port}";
             if (!request.Headers.Contains("Host"))
             {
-                builder.Append("Host: ");
-                builder.Append(hostHeader);
-                builder.Append("\r\n");
+                WriteHeader("Host", new[] { hostHeader });
             }
 
             foreach (var header in request.Headers)
             {
-                builder.Append(header.Key);
-                builder.Append(':');
-                builder.Append(' ');
-                builder.Append(string.Join(", ", header.Value));
-                builder.Append("\r\n");
+                WriteHeader(header.Key, header.Value);
             }
 
             if (request.Content != null)
             {
                 foreach (var header in request.Content.Headers)
                 {
-                    builder.Append(header.Key);
-                    builder.Append(':');
-                    builder.Append(' ');
-                    builder.Append(string.Join(", ", header.Value));
-                    builder.Append("\r\n");
+                    WriteHeader(header.Key, header.Value);
                 }
             }
 
-            builder.Append("\r\n");
+            WriteCrlf();
 
-            var headerBytes = Encoding.ASCII.GetBytes(builder.ToString());
+            var headers = writer.WrittenMemory;
             if (contentBytes.Length == 0)
             {
-                return headerBytes;
+                return headers.ToArray();
             }
 
-            var result = new byte[headerBytes.Length + contentBytes.Length];
-            Buffer.BlockCopy(headerBytes, 0, result, 0, headerBytes.Length);
-            Buffer.BlockCopy(contentBytes, 0, result, headerBytes.Length, contentBytes.Length);
+            var result = new byte[headers.Length + contentBytes.Length];
+            headers.Span.CopyTo(result);
+            Buffer.BlockCopy(contentBytes, 0, result, headers.Length, contentBytes.Length);
             return result;
         }
 

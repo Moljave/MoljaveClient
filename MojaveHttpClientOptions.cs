@@ -268,7 +268,7 @@ namespace Moljave.Http
         };
     }
 
-    public sealed class MojaveTlsSettings
+    public sealed class MojaveTlsSettings : IEquatable<MojaveTlsSettings>
     {
         public static MojaveTlsSettings Default { get; } = new();
 
@@ -277,5 +277,95 @@ namespace Moljave.Http
         public bool ValidateCertificate { get; set; } = false;
         public RemoteCertificateValidationCallback CertificateValidationCallback { get; set; }
             = (_, _, _, _) => true;
+
+        public bool Equals(MojaveTlsSettings other)
+        {
+            if (ReferenceEquals(this, other))
+            {
+                return true;
+            }
+
+            if (other is null)
+            {
+                return false;
+            }
+
+            return Nullable.Equals(EnabledProtocols, other.EnabledProtocols) &&
+                   ProtocolsEqual(ApplicationProtocols, other.ApplicationProtocols) &&
+                   ValidateCertificate == other.ValidateCertificate &&
+                   Equals(CertificateValidationCallback, other.CertificateValidationCallback);
+        }
+
+        public override bool Equals(object obj) => Equals(obj as MojaveTlsSettings);
+
+        public override int GetHashCode()
+        {
+            var hash = new HashCode();
+            hash.Add(EnabledProtocols);
+            AddProtocolsHash(ref hash, ApplicationProtocols);
+            hash.Add(ValidateCertificate);
+            hash.Add(CertificateValidationCallback);
+            return hash.ToHashCode();
+        }
+
+        private static bool ProtocolsEqual(IEnumerable<string> first, IEnumerable<string> second)
+        {
+            if (ReferenceEquals(first, second))
+            {
+                return true;
+            }
+
+            if (first == null || second == null)
+            {
+                return first == null && second == null;
+            }
+
+            using var firstEnumerator = NormalizeProtocols(first).GetEnumerator();
+            using var secondEnumerator = NormalizeProtocols(second).GetEnumerator();
+
+            while (true)
+            {
+                var hasFirst = firstEnumerator.MoveNext();
+                var hasSecond = secondEnumerator.MoveNext();
+
+                if (!hasFirst || !hasSecond)
+                {
+                    return hasFirst == hasSecond;
+                }
+
+                if (!string.Equals(firstEnumerator.Current, secondEnumerator.Current, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+        }
+
+        private static IEnumerable<string> NormalizeProtocols(IEnumerable<string> protocols)
+        {
+            if (protocols == null)
+            {
+                return Array.Empty<string>();
+            }
+
+            return protocols is string[] array
+                ? array
+                : protocols is IList<string> list
+                    ? list
+                    : new List<string>(protocols);
+        }
+
+        private static void AddProtocolsHash(ref HashCode hash, IEnumerable<string> protocols)
+        {
+            if (protocols == null)
+            {
+                hash.Add(0);
+                return;
+            }
+
+            foreach (var protocol in NormalizeProtocols(protocols))
+            {
+                hash.Add(protocol, StringComparer.Ordinal);
+            }
+        }
     }
 }

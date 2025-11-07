@@ -12,7 +12,7 @@ namespace Moljave.Http
         Socks5
     }
 
-    public sealed class ProxyDescriptor
+    public sealed class ProxyDescriptor : IEquatable<ProxyDescriptor>
     {
         public ProxyDescriptor(ProxyScheme scheme, string host, int port, NetworkCredential credentials = null, bool resolveHostnamesRemotely = false)
         {
@@ -45,6 +45,66 @@ namespace Moljave.Http
             }
 
             return proxy;
+        }
+
+        public bool Equals(ProxyDescriptor other)
+        {
+            if (ReferenceEquals(this, other))
+            {
+                return true;
+            }
+
+            if (other is null)
+            {
+                return false;
+            }
+
+            return Scheme == other.Scheme &&
+                   string.Equals(Host, other.Host, StringComparison.OrdinalIgnoreCase) &&
+                   Port == other.Port &&
+                   ResolveHostnamesRemotely == other.ResolveHostnamesRemotely &&
+                   CredentialsEqual(Credentials, other.Credentials);
+        }
+
+        public override bool Equals(object obj) => Equals(obj as ProxyDescriptor);
+
+        public override int GetHashCode()
+        {
+            var hash = new HashCode();
+            hash.Add(Scheme);
+            hash.Add(Host, StringComparer.OrdinalIgnoreCase);
+            hash.Add(Port);
+            hash.Add(ResolveHostnamesRemotely);
+
+            if (Credentials != null)
+            {
+                hash.Add(Credentials.UserName, StringComparer.Ordinal);
+                hash.Add(Credentials.Password, StringComparer.Ordinal);
+                hash.Add(Credentials.Domain, StringComparer.Ordinal);
+            }
+            else
+            {
+                hash.Add(0);
+            }
+
+            return hash.ToHashCode();
+        }
+
+        private static bool CredentialsEqual(NetworkCredential first, NetworkCredential second)
+        {
+            if (ReferenceEquals(first, second))
+            {
+                return true;
+            }
+
+            if (first == null || second == null)
+            {
+                return false;
+            }
+
+            return string.Equals(first.UserName, second.UserName, StringComparison.Ordinal) &&
+                   string.Equals(first.Password, second.Password, StringComparison.Ordinal) &&
+                   string.Equals(first.Domain, second.Domain, StringComparison.Ordinal);
         }
     }
 

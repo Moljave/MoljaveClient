@@ -41,6 +41,11 @@ namespace Moljave.Http
         {
         }
 
+        public MojaveHttpClient(bool useJA3Spoofing = true)
+            : this(new MojaveHttpClientOptions { EnableJa3Fingerprinting = useJA3Spoofing })
+        {
+        }
+
         public MojaveHttpClient(CookieContainer cookieContainer, WebProxy proxy = null)
             : this(options =>
             {
@@ -68,10 +73,9 @@ namespace Moljave.Http
 
         public MojaveHttpClient(MojaveHttpClientOptions options)
         {
-            PlatformRequirements.EnsureSupportedWindows();
-
             _options = options ?? throw new ArgumentNullException(nameof(options));
-            _ja3FingerprintingEnabled = _options.EnableJa3Fingerprinting;
+            _ja3FingerprintingEnabled = options.EnableJa3Fingerprinting;
+            _options.EnableJa3Fingerprinting = _ja3FingerprintingEnabled;
 
             _cookieManager = _options.CookieManager ?? new MojaveCookieManager();
             _options.CookieManager = _cookieManager;
@@ -80,7 +84,7 @@ namespace Moljave.Http
 
             if (_ja3FingerprintingEnabled)
             {
-                InitializeFingerprint(_options.FingerprintProvider);
+                InitializeFingerprint(options.FingerprintProvider);
                 _options.FingerprintProvider = ResolveFingerprint;
             }
             else

@@ -18,6 +18,9 @@ namespace Moljave.Http
     public sealed class TlsClient : IDisposable
     {
         private static readonly IdnMapping s_idnMapping = new();
+        private static readonly byte[] s_socks4DomainPlaceholder = { 0x00, 0x00, 0x00, 0x01 };
+        private static readonly byte[] s_socks5GreetingNoAuth = { 0x05, 0x01, 0x00 };
+        private static readonly byte[] s_socks5GreetingWithAuth = { 0x05, 0x02, 0x00, 0x02 };
 
         private const int MinimumSocketBufferSize = 1024;
 
@@ -513,7 +516,7 @@ namespace Moljave.Http
             var normalizedHost = NormalizeHostname(_host);
             var addressBytes = !_proxy.ResolveHostnamesRemotely && TryGetIpAddress(normalizedHost, out var ipAddress)
                 ? ipAddress.GetAddressBytes()
-                : new byte[] { 0x00, 0x00, 0x00, 0x01 };
+                : s_socks4DomainPlaceholder;
 
             var userId = _proxy.Credentials?.UserName ?? string.Empty;
             var hostBytes = Encoding.ASCII.GetBytes(normalizedHost ?? string.Empty);
@@ -523,136 +526,198 @@ namespace Moljave.Http
             {
                 throw new ProxyException("SOCKS4 proxy hostname is too long.", ProxyErrorReason.Unsupported);
             }
-            var buffer = new byte[9 + userId.Length + (useDomain ? hostBytes.Length + 1 : 0)];
-            int index = 0;
-            buffer[index++] = 0x04;
-            buffer[index++] = 0x01;
-            buffer[index++] = (byte)(_port >> 8);
-            buffer[index++] = (byte)(_port & 0xFF);
-            Buffer.BlockCopy(addressBytes, 0, buffer, index, 4);
-            index += 4;
-            var userBytes = Encoding.ASCII.GetBytes(userId);
-            Buffer.BlockCopy(userBytes, 0, buffer, index, userBytes.Length);
-            index += userBytes.Length;
-            buffer[index++] = 0x00;
 
-            if (useDomain)
+            byte[] buffer = null;
+            byte[] response = null;
+
+            try
             {
-                Buffer.BlockCopy(hostBytes, 0, buffer, index, hostBytes.Length);
-                index += hostBytes.Length;
+                var bufferLength = 9 + userId.Length + (useDomain ? hostBytes.Length + 1 : 0);
+                buffer = ArrayPool<byte>.Shared.Rent(bufferLength);
+                int index = 0;
+                buffer[index++] = 0x04;
+                buffer[index++] = 0x01;
+                buffer[index++] = (byte)(_port >> 8);
+                buffer[index++] = (byte)(_port & 0xFF);
+                Buffer.BlockCopy(addressBytes, 0, buffer, index, 4);
+                index += 4;
+                var userBytes = Encoding.ASCII.GetBytes(userId);
+                Buffer.BlockCopy(userBytes, 0, buffer, index, userBytes.Length);
+                index += userBytes.Length;
                 buffer[index++] = 0x00;
+
+                if (useDomain)
+                {
+                    Buffer.BlockCopy(hostBytes, 0, buffer, index, hostBytes.Length);
+                    index += hostBytes.Length;
+                    buffer[index++] = 0x00;
+                }
+
+                await stream.WriteAsync(buffer, 0, index, cancellationToken).ConfigureAwait(false);
+                await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+                response = ArrayPool<byte>.Shared.Rent(8);
+                await ReadExactAsync(stream, response, 8, cancellationToken).ConfigureAwait(false);
+
+                if (response[1] != 0x5A)
+                {
+                    throw new ProxyException($"SOCKS4 proxy connection failed: {DescribeSocks4Status(response[1])}", ProxyErrorReason.ResponseError);
+                }
+
+                return stream;
             }
-
-            await stream.WriteAsync(buffer, 0, index, cancellationToken).ConfigureAwait(false);
-            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-
-            var response = new byte[8];
-            await ReadExactAsync(stream, response, cancellationToken).ConfigureAwait(false);
-
-            if (response[1] != 0x5A)
+            finally
             {
-                throw new ProxyException($"SOCKS4 proxy connection failed: {DescribeSocks4Status(response[1])}", ProxyErrorReason.ResponseError);
-            }
+                if (buffer != null)
+                {
+                    ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
+                }
 
-            return stream;
+                if (response != null)
+                {
+                    ArrayPool<byte>.Shared.Return(response);
+                }
+            }
         }
 
         private async Task<Stream> EstablishSocks5TunnelAsync(NetworkStream stream, CancellationToken cancellationToken)
         {
             var hasCredentials = _proxy.Credentials is NetworkCredential;
-            var greeting = hasCredentials
-                ? new byte[] { 0x05, 0x02, 0x00, 0x02 }
-                : new byte[] { 0x05, 0x01, 0x00 };
+            var greeting = hasCredentials ? s_socks5GreetingWithAuth : s_socks5GreetingNoAuth;
 
             await stream.WriteAsync(greeting, 0, greeting.Length, cancellationToken).ConfigureAwait(false);
             await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
 
-            var methodSelection = new byte[2];
-            await ReadExactAsync(stream, methodSelection, cancellationToken).ConfigureAwait(false);
+            byte[] methodSelection = null;
+            byte[] authRequest = null;
+            byte[] authResponse = null;
+            byte[] connectRequest = null;
+            byte[] responseHeader = null;
+            byte[] skipBuffer = null;
 
-            if (methodSelection[0] != 0x05)
+            try
             {
-                throw new ProxyException("SOCKS5 proxy handshake failed: invalid version.", ProxyErrorReason.ProtocolError);
-            }
+                methodSelection = ArrayPool<byte>.Shared.Rent(2);
+                await ReadExactAsync(stream, methodSelection, 2, cancellationToken).ConfigureAwait(false);
 
-            if (methodSelection[1] == 0x02)
-            {
-                if (!hasCredentials)
+                if (methodSelection[0] != 0x05)
                 {
-                    throw new ProxyException("SOCKS5 proxy requires authentication but no credentials were provided.", ProxyErrorReason.AuthenticationRequired);
+                    throw new ProxyException("SOCKS5 proxy handshake failed: invalid version.", ProxyErrorReason.ProtocolError);
                 }
 
-                var creds = (NetworkCredential)_proxy.Credentials;
-                var userBytes = Encoding.ASCII.GetBytes(creds.UserName ?? string.Empty);
-                var passBytes = Encoding.ASCII.GetBytes(creds.Password ?? string.Empty);
-                var authRequest = new byte[3 + userBytes.Length + passBytes.Length];
-                int index = 0;
-                authRequest[index++] = 0x01;
-                authRequest[index++] = (byte)userBytes.Length;
-                Buffer.BlockCopy(userBytes, 0, authRequest, index, userBytes.Length);
-                index += userBytes.Length;
-                authRequest[index++] = (byte)passBytes.Length;
-                Buffer.BlockCopy(passBytes, 0, authRequest, index, passBytes.Length);
+                if (methodSelection[1] == 0x02)
+                {
+                    if (!hasCredentials)
+                    {
+                        throw new ProxyException("SOCKS5 proxy requires authentication but no credentials were provided.", ProxyErrorReason.AuthenticationRequired);
+                    }
 
-                await stream.WriteAsync(authRequest, 0, authRequest.Length, cancellationToken).ConfigureAwait(false);
+                    var creds = (NetworkCredential)_proxy.Credentials;
+                    var userBytes = Encoding.ASCII.GetBytes(creds.UserName ?? string.Empty);
+                    var passBytes = Encoding.ASCII.GetBytes(creds.Password ?? string.Empty);
+                    var authLength = 3 + userBytes.Length + passBytes.Length;
+                    authRequest = ArrayPool<byte>.Shared.Rent(authLength);
+                    int index = 0;
+                    authRequest[index++] = 0x01;
+                    authRequest[index++] = (byte)userBytes.Length;
+                    Buffer.BlockCopy(userBytes, 0, authRequest, index, userBytes.Length);
+                    index += userBytes.Length;
+                    authRequest[index++] = (byte)passBytes.Length;
+                    Buffer.BlockCopy(passBytes, 0, authRequest, index, passBytes.Length);
+
+                    await stream.WriteAsync(authRequest, 0, authLength, cancellationToken).ConfigureAwait(false);
+                    await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+                    authResponse = ArrayPool<byte>.Shared.Rent(2);
+                    await ReadExactAsync(stream, authResponse, 2, cancellationToken).ConfigureAwait(false);
+                    if (authResponse[1] != 0x00)
+                    {
+                        throw new ProxyException("SOCKS5 proxy authentication failed.", ProxyErrorReason.AuthenticationFailed);
+                    }
+                }
+                else if (methodSelection[1] == 0xFF)
+                {
+                    throw new ProxyException("SOCKS5 proxy does not accept provided authentication methods.", ProxyErrorReason.AuthenticationFailed);
+                }
+                else if (methodSelection[1] != 0x00)
+                {
+                    throw new ProxyException(
+                        $"SOCKS5 proxy returned unsupported authentication method 0x{methodSelection[1]:X2}.",
+                        ProxyErrorReason.AuthenticationRequired);
+                }
+
+                var (addressType, addressPayload) = BuildSocks5Address();
+                var connectLength = 4 + addressPayload.Length + 2;
+                connectRequest = ArrayPool<byte>.Shared.Rent(connectLength);
+                int requestIndex = 0;
+                connectRequest[requestIndex++] = 0x05;
+                connectRequest[requestIndex++] = 0x01;
+                connectRequest[requestIndex++] = 0x00;
+                connectRequest[requestIndex++] = addressType;
+                Buffer.BlockCopy(addressPayload, 0, connectRequest, requestIndex, addressPayload.Length);
+                requestIndex += addressPayload.Length;
+                connectRequest[requestIndex++] = (byte)(_port >> 8);
+                connectRequest[requestIndex] = (byte)(_port & 0xFF);
+
+                await stream.WriteAsync(connectRequest, 0, connectLength, cancellationToken).ConfigureAwait(false);
                 await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
 
-                var authResponse = new byte[2];
-                await ReadExactAsync(stream, authResponse, cancellationToken).ConfigureAwait(false);
-                if (authResponse[1] != 0x00)
+                responseHeader = ArrayPool<byte>.Shared.Rent(4);
+                await ReadExactAsync(stream, responseHeader, 4, cancellationToken).ConfigureAwait(false);
+
+                if (responseHeader[1] != 0x00)
                 {
-                    throw new ProxyException("SOCKS5 proxy authentication failed.", ProxyErrorReason.AuthenticationFailed);
+                    throw new ProxyException($"SOCKS5 proxy connect failed: {DescribeSocks5Status(responseHeader[1])}", ProxyErrorReason.ResponseError);
+                }
+
+                var skipLength = responseHeader[3] switch
+                {
+                    0x01 => 4,
+                    0x03 => await ReadLengthAsync(stream, cancellationToken).ConfigureAwait(false),
+                    0x04 => 16,
+                    _ => throw new IOException("SOCKS5 proxy returned unknown address type")
+                };
+
+                if (skipLength > 0)
+                {
+                    skipBuffer = ArrayPool<byte>.Shared.Rent(skipLength + 2);
+                    await ReadExactAsync(stream, skipBuffer, skipLength + 2, cancellationToken).ConfigureAwait(false);
+                }
+
+                return stream;
+            }
+            finally
+            {
+                if (methodSelection != null)
+                {
+                    ArrayPool<byte>.Shared.Return(methodSelection);
+                }
+
+                if (authRequest != null)
+                {
+                    ArrayPool<byte>.Shared.Return(authRequest, clearArray: true);
+                }
+
+                if (authResponse != null)
+                {
+                    ArrayPool<byte>.Shared.Return(authResponse, clearArray: true);
+                }
+
+                if (connectRequest != null)
+                {
+                    ArrayPool<byte>.Shared.Return(connectRequest);
+                }
+
+                if (responseHeader != null)
+                {
+                    ArrayPool<byte>.Shared.Return(responseHeader);
+                }
+
+                if (skipBuffer != null)
+                {
+                    ArrayPool<byte>.Shared.Return(skipBuffer);
                 }
             }
-            else if (methodSelection[1] == 0xFF)
-            {
-                throw new ProxyException("SOCKS5 proxy does not accept provided authentication methods.", ProxyErrorReason.AuthenticationFailed);
-            }
-            else if (methodSelection[1] != 0x00)
-            {
-                throw new ProxyException(
-                    $"SOCKS5 proxy returned unsupported authentication method 0x{methodSelection[1]:X2}.",
-                    ProxyErrorReason.AuthenticationRequired);
-            }
-
-            var (addressType, addressPayload) = BuildSocks5Address();
-            var connectRequest = new byte[4 + addressPayload.Length + 2];
-            int requestIndex = 0;
-            connectRequest[requestIndex++] = 0x05;
-            connectRequest[requestIndex++] = 0x01;
-            connectRequest[requestIndex++] = 0x00;
-            connectRequest[requestIndex++] = addressType;
-            Buffer.BlockCopy(addressPayload, 0, connectRequest, requestIndex, addressPayload.Length);
-            requestIndex += addressPayload.Length;
-            connectRequest[requestIndex++] = (byte)(_port >> 8);
-            connectRequest[requestIndex] = (byte)(_port & 0xFF);
-
-            await stream.WriteAsync(connectRequest, 0, connectRequest.Length, cancellationToken).ConfigureAwait(false);
-            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-
-            var responseHeader = new byte[4];
-            await ReadExactAsync(stream, responseHeader, cancellationToken).ConfigureAwait(false);
-
-            if (responseHeader[1] != 0x00)
-            {
-                throw new ProxyException($"SOCKS5 proxy connect failed: {DescribeSocks5Status(responseHeader[1])}", ProxyErrorReason.ResponseError);
-            }
-
-            var skipLength = responseHeader[3] switch
-            {
-                0x01 => 4,
-                0x03 => await ReadLengthAsync(stream, cancellationToken).ConfigureAwait(false),
-                0x04 => 16,
-                _ => throw new IOException("SOCKS5 proxy returned unknown address type")
-            };
-
-            if (skipLength > 0)
-            {
-                var skipBuffer = new byte[skipLength + 2];
-                await ReadExactAsync(stream, skipBuffer, cancellationToken).ConfigureAwait(false);
-            }
-
-            return stream;
         }
 
         private static bool IsSuccessfulHttpProxyResponse(string response, out HttpStatusCode? statusCode, out string statusLine)
@@ -734,9 +799,16 @@ namespace Moljave.Http
 
         private static async Task<int> ReadLengthAsync(NetworkStream stream, CancellationToken cancellationToken)
         {
-            var lengthBuffer = new byte[1];
-            await ReadExactAsync(stream, lengthBuffer, cancellationToken).ConfigureAwait(false);
-            return lengthBuffer[0];
+            var lengthBuffer = ArrayPool<byte>.Shared.Rent(1);
+            try
+            {
+                await ReadExactAsync(stream, lengthBuffer, 1, cancellationToken).ConfigureAwait(false);
+                return lengthBuffer[0];
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(lengthBuffer);
+            }
         }
 
         private static bool TryGetIpAddress(string host, out IPAddress address)
@@ -807,12 +879,15 @@ namespace Moljave.Http
             return $"Basic {token}";
         }
 
-        private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
+        private static Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
+            => ReadExactAsync(stream, buffer, buffer.Length, cancellationToken);
+
+        private static async Task ReadExactAsync(Stream stream, byte[] buffer, int length, CancellationToken cancellationToken)
         {
             int read = 0;
-            while (read < buffer.Length)
+            while (read < length)
             {
-                var current = await stream.ReadAsync(buffer, read, buffer.Length - read, cancellationToken).ConfigureAwait(false);
+                var current = await stream.ReadAsync(buffer, read, length - read, cancellationToken).ConfigureAwait(false);
                 if (current == 0)
                 {
                     throw new IOException("Unexpected end of stream");
