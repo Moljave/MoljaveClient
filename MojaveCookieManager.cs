@@ -203,9 +203,54 @@ namespace Moljave.Http
             {
                 foreach (var header in setCookieHeaders.Where(h => !string.IsNullOrWhiteSpace(h)))
                 {
-                    _container.SetCookies(uri, header);
+                    var trimmedHeader = header.Trim();
+                    if (trimmedHeader.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    if (TrySetCookies(uri, trimmedHeader))
+                    {
+                        continue;
+                    }
+
+                    var sanitized = SanitizeCookieHeader(trimmedHeader);
+                    TrySetCookies(uri, sanitized);
                 }
             }
+        }
+
+        private bool TrySetCookies(Uri uri, string header)
+        {
+            if (string.IsNullOrWhiteSpace(header))
+            {
+                return false;
+            }
+
+            try
+            {
+                _container.SetCookies(uri, header);
+                return true;
+            }
+            catch (CookieException)
+            {
+                return false;
+            }
+        }
+
+        private static string SanitizeCookieHeader(string header)
+        {
+            if (string.IsNullOrWhiteSpace(header))
+            {
+                return string.Empty;
+            }
+
+            var segments = header
+                .Split(';')
+                .Select(segment => segment.Trim())
+                .Where(segment => !string.IsNullOrWhiteSpace(segment) && !segment.StartsWith("$", StringComparison.Ordinal));
+
+            return string.Join("; ", segments);
         }
 
         private IEnumerable<Cookie> EnumerateCookiesInternal()
