@@ -22,8 +22,45 @@ namespace Moljave.Http
         private int _socketBufferSize = 8 * 1024;
         private int _forceConnectionCloseAfterRequest = 0;
 
-        public Func<JA3Fingerprint> FingerprintProvider { get; set; } =
-            () => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome);
+        private Func<JA3Fingerprint> _fingerprintProvider;
+        private bool _fingerprintProviderOverridden;
+        private Ja3Preset _fingerprintPreset = Ja3Preset.Chrome;
+
+        public MojaveHttpClientOptions()
+        {
+            _fingerprintProvider = CreatePresetProvider(_fingerprintPreset);
+        }
+
+        public Func<JA3Fingerprint> FingerprintProvider
+        {
+            get => _fingerprintProvider;
+            set
+            {
+                if (value == null)
+                {
+                    _fingerprintProvider = CreatePresetProvider(_fingerprintPreset);
+                    _fingerprintProviderOverridden = false;
+                }
+                else
+                {
+                    _fingerprintProvider = value;
+                    _fingerprintProviderOverridden = true;
+                }
+            }
+        }
+
+        public Ja3Preset FingerprintPreset
+        {
+            get => _fingerprintPreset;
+            set
+            {
+                _fingerprintPreset = value;
+                if (!_fingerprintProviderOverridden)
+                {
+                    _fingerprintProvider = CreatePresetProvider(value);
+                }
+            }
+        }
 
         public bool EnableJa3Fingerprinting { get; set; } = true;
 
@@ -238,6 +275,15 @@ namespace Moljave.Http
 
             return current;
         }
+
+        private static Func<JA3Fingerprint> CreatePresetProvider(Ja3Preset preset)
+        {
+            return preset switch
+            {
+                Ja3Preset.Disabled => () => null,
+                _ => () => JA3FingerprintFactory.GetFingerprint(preset)
+            };
+        }
     }
 
     public sealed class MojaveRequestOptions
@@ -278,4 +324,5 @@ namespace Moljave.Http
         public RemoteCertificateValidationCallback CertificateValidationCallback { get; set; }
             = (_, _, _, _) => true;
     }
+
 }

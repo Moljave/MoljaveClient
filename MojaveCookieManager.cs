@@ -108,6 +108,49 @@ namespace Moljave.Http
             }
         }
 
+        public void ChangeCookieValue(string name, string newValue)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentNullException(nameof(name));
+            }
+
+            lock (_syncRoot)
+            {
+                var comparer = StringComparer.OrdinalIgnoreCase;
+                var updated = new List<Cookie>();
+                var modified = false;
+                var targetValue = newValue ?? string.Empty;
+
+                foreach (var cookie in EnumerateCookiesInternal())
+                {
+                    if (cookie == null)
+                    {
+                        continue;
+                    }
+
+                    var clone = CloneCookie(cookie);
+                    var cloneName = clone.Name ?? string.Empty;
+                    if (comparer.Equals(cloneName, name))
+                    {
+                        if (!string.Equals(clone.Value, targetValue, StringComparison.Ordinal) || clone.Expired)
+                        {
+                            clone.Value = targetValue;
+                            clone.Expired = false;
+                            modified = true;
+                        }
+                    }
+
+                    updated.Add(clone);
+                }
+
+                if (modified)
+                {
+                    ReplaceContainerWith(updated);
+                }
+            }
+        }
+
         public void RemoveCookie(string domain, string name, string path = "/")
         {
             if (string.IsNullOrWhiteSpace(domain))
@@ -128,6 +171,94 @@ namespace Moljave.Http
             lock (_syncRoot)
             {
                 _container.Add(cookie);
+            }
+        }
+
+        public void RemoveCookie(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentNullException(nameof(name));
+            }
+
+            lock (_syncRoot)
+            {
+                var comparer = StringComparer.OrdinalIgnoreCase;
+                var retained = new List<Cookie>();
+                var removed = false;
+
+                foreach (var cookie in EnumerateCookiesInternal())
+                {
+                    if (cookie == null)
+                    {
+                        continue;
+                    }
+
+                    var cookieName = cookie.Name ?? string.Empty;
+                    if (comparer.Equals(cookieName, name))
+                    {
+                        removed = true;
+                        continue;
+                    }
+
+                    retained.Add(CloneCookie(cookie));
+                }
+
+                if (removed)
+                {
+                    ReplaceContainerWith(retained);
+                }
+            }
+        }
+
+        public void RemoveCookies(List<string> excludeNames)
+        {
+            lock (_syncRoot)
+            {
+                HashSet<string> exclusions = null;
+                if (excludeNames != null && excludeNames.Count > 0)
+                {
+                    exclusions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var name in excludeNames)
+                    {
+                        if (!string.IsNullOrWhiteSpace(name))
+                        {
+                            exclusions.Add(name);
+                        }
+                    }
+                }
+
+                if (exclusions == null || exclusions.Count == 0)
+                {
+                    _container = new CookieContainer();
+                    return;
+                }
+
+                var retained = new List<Cookie>();
+                var modified = false;
+
+                foreach (var cookie in EnumerateCookiesInternal())
+                {
+                    if (cookie == null)
+                    {
+                        continue;
+                    }
+
+                    var cookieName = cookie.Name ?? string.Empty;
+                    if (exclusions.Contains(cookieName))
+                    {
+                        retained.Add(CloneCookie(cookie));
+                    }
+                    else
+                    {
+                        modified = true;
+                    }
+                }
+
+                if (modified)
+                {
+                    ReplaceContainerWith(retained);
+                }
             }
         }
 
@@ -292,12 +423,25 @@ namespace Moljave.Http
 
         private static Cookie CloneCookie(Cookie cookie)
         {
-            return new Cookie(cookie?.Name ?? string.Empty, cookie?.Value ?? string.Empty, cookie?.Path ?? "/", cookie?.Domain ?? string.Empty)
+            if (cookie == null)
             {
-                Expires = cookie?.Expires ?? DateTime.MinValue,
-                HttpOnly = cookie?.HttpOnly ?? false,
-                Secure = cookie?.Secure ?? false
+                return new Cookie(string.Empty, string.Empty);
+            }
+
+            var clone = new Cookie(cookie.Name ?? string.Empty, cookie.Value ?? string.Empty, cookie.Path ?? "/", cookie.Domain ?? string.Empty)
+            {
+                Expires = cookie.Expires,
+                HttpOnly = cookie.HttpOnly,
+                Secure = cookie.Secure,
+                Discard = cookie.Discard,
+                Comment = cookie.Comment,
+                CommentUri = cookie.CommentUri,
+                Port = cookie.Port,
+                Version = cookie.Version,
+                Expired = cookie.Expired
             };
+
+            return clone;
         }
 
         private static bool IsDomainMatch(string cookieDomain, string targetDomain)
@@ -326,6 +470,33 @@ namespace Moljave.Http
             }
 
             return domain.Trim().TrimStart('.').ToLowerInvariant();
+        }
+
+        private void ReplaceContainerWith(IEnumerable<Cookie> cookies)
+        {
+            var updated = new CookieContainer();
+
+            if (cookies != null)
+            {
+                foreach (var cookie in cookies)
+                {
+                    if (cookie == null)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        updated.Add(cookie);
+                    }
+                    catch (CookieException)
+                    {
+                        // Ignore invalid cookies to avoid corrupting the container.
+                    }
+                }
+            }
+
+            _container = updated;
         }
     }
 }

@@ -23,6 +23,7 @@ namespace Moljave.Http
 
         private readonly string _host;
         private readonly int _port;
+        private readonly bool _targetUsesTls;
         private readonly JA3Fingerprint _fingerprint;
         private readonly ProxyDescriptor _proxy;
         private readonly MojaveTlsSettings _tlsSettings;
@@ -37,6 +38,7 @@ namespace Moljave.Http
         public TlsClient(
             string host,
             int port,
+            bool targetUsesTls,
             JA3Fingerprint fingerprint,
             ProxyDescriptor proxy,
             MojaveTlsSettings tlsSettings,
@@ -45,6 +47,7 @@ namespace Moljave.Http
         {
             _host = host ?? throw new ArgumentNullException(nameof(host));
             _port = port;
+            _targetUsesTls = targetUsesTls;
             _fingerprint = fingerprint;
             _proxy = proxy;
             _tlsSettings = tlsSettings ?? MojaveTlsSettings.Default;
@@ -412,7 +415,9 @@ namespace Moljave.Http
                 {
                     case ProxyScheme.Http:
                     case ProxyScheme.Https:
-                        _transportStream = await EstablishHttpTunnelAsync(activeStream, cancellationToken).ConfigureAwait(false);
+                        _transportStream = _targetUsesTls
+                            ? await EstablishHttpTunnelAsync(activeStream, cancellationToken).ConfigureAwait(false)
+                            : activeStream;
                         break;
                     case ProxyScheme.Socks4:
                     case ProxyScheme.Socks4a:

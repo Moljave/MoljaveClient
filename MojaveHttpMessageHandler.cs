@@ -146,7 +146,7 @@ namespace Moljave.Http
 
         private JA3Fingerprint GetEffectiveFingerprint(MojaveRequestOptions requestOptions)
         {
-            if (!_options.EnableJa3Fingerprinting)
+            if (!_options.EnableJa3Fingerprinting || _options.FingerprintPreset == Ja3Preset.Disabled)
             {
                 return null;
             }
@@ -156,7 +156,17 @@ namespace Moljave.Http
                 return requestOptions.Fingerprint;
             }
 
-            return _options.FingerprintProvider?.Invoke() ?? JA3Fingerprint.Default;
+            var resolved = _options.FingerprintProvider?.Invoke();
+            if (resolved != null)
+            {
+                return resolved;
+            }
+
+            var preset = _options.FingerprintPreset == Ja3Preset.Disabled
+                ? Ja3Preset.Default
+                : _options.FingerprintPreset;
+
+            return JA3FingerprintFactory.GetFingerprint(preset);
         }
 
         private static bool IsRedirect(HttpStatusCode statusCode)
@@ -198,6 +208,7 @@ namespace Moljave.Http
             var targetPort = uri.IsDefaultPort ? (useTls ? 443 : 80) : uri.Port;
 
             Exception lastException = null;
+            var lastUsedAbsoluteUri = false;
 
             for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
@@ -208,6 +219,15 @@ namespace Moljave.Http
                 TlsClientLease lease = null;
                 CancellationTokenSource waitCts = null;
                 CancellationTokenSource linkedCts = null;
+                var sendAbsoluteUri = ShouldSendAbsoluteUri(proxyOptions, useTls);
+                if (sendAbsoluteUri != lastUsedAbsoluteUri)
+                {
+                    requestPayloadDirty = true;
+                }
+                if (sendAbsoluteUri && EnsureProxyHeadersForHttpProxy(request, proxyOptions?.Descriptor))
+                {
+                    requestPayloadDirty = true;
+                }
 
                 try
                 {
@@ -240,8 +260,9 @@ namespace Moljave.Http
 
                     if (requestPayloadDirty || cachedRequestPayload == null)
                     {
-                        cachedRequestPayload = await HttpRequestStringifier.Stringify(request).ConfigureAwait(false);
+                        cachedRequestPayload = await HttpRequestStringifier.Stringify(request, sendAbsoluteUri).ConfigureAwait(false);
                         requestPayloadDirty = false;
+                        lastUsedAbsoluteUri = sendAbsoluteUri;
                     }
 
                     var requestPayload = cachedRequestPayload;
@@ -551,6 +572,7 @@ namespace Moljave.Http
                             var connector = new TlsClient(
                                 context.DnsEndPoint.Host,
                                 context.DnsEndPoint.Port,
+                                useTls: true,
                                 fingerprint,
                                 proxyOptions.Descriptor,
                                 tlsSettings,
@@ -779,6 +801,91 @@ namespace Moljave.Http
             }
 
             return cookieManager;
+        }
+
+        private static bool ShouldSendAbsoluteUri(MojaveProxyOptions proxyOptions, bool targetUsesTls)
+        {
+            var descriptor = proxyOptions?.Descriptor;
+            if (descriptor == null)
+            {
+                return false;
+            }
+
+            if (targetUsesTls)
+            {
+                return false;
+            }
+
+            return descriptor.Scheme == ProxyScheme.Http || descriptor.Scheme == ProxyScheme.Https;
+        }
+
+        private static bool EnsureProxyHeadersForHttpProxy(HttpRequestMessage request, ProxyDescriptor descriptor)
+        {
+            if (request == null || descriptor == null)
+            {
+                return false;
+            }
+
+            var modified = false;
+
+            if (!request.Headers.Contains("Proxy-Connection"))
+            {
+                request.Headers.TryAddWithoutValidation("Proxy-Connection", "Keep-Alive");
+                modified = true;
+            }
+
+            var headerValue = BuildProxyAuthorizationHeader(descriptor.Credentials);
+
+            if (string.IsNullOrEmpty(headerValue))
+            {
+                if (request.Headers.Contains("Proxy-Authorization"))
+                {
+                    request.Headers.Remove("Proxy-Authorization");
+                    modified = true;
+                }
+            }
+            else
+            {
+                var needsUpdate = true;
+                if (request.Headers.TryGetValues("Proxy-Authorization", out var existingValues))
+                {
+                    foreach (var existing in existingValues)
+                    {
+                        if (string.Equals(existing, headerValue, StringComparison.Ordinal))
+                        {
+                            needsUpdate = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (needsUpdate)
+                {
+                    request.Headers.Remove("Proxy-Authorization");
+                    request.Headers.TryAddWithoutValidation("Proxy-Authorization", headerValue);
+                    modified = true;
+                }
+            }
+
+            return modified;
+        }
+
+        private static string BuildProxyAuthorizationHeader(NetworkCredential credential)
+        {
+            if (credential == null)
+            {
+                return null;
+            }
+
+            var username = credential.UserName ?? string.Empty;
+            if (!string.IsNullOrEmpty(credential.Domain))
+            {
+                username = $"{credential.Domain}\\{username}";
+            }
+
+            var password = credential.Password ?? string.Empty;
+            var token = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{username}:{password}"));
+            return $"Basic {token}";
         }
 
         private static async Task DelayForRetryAsync(

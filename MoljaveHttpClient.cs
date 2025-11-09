@@ -71,7 +71,8 @@ namespace Moljave.Http
             PlatformRequirements.EnsureSupportedWindows();
 
             _options = options ?? throw new ArgumentNullException(nameof(options));
-            _ja3FingerprintingEnabled = _options.EnableJa3Fingerprinting;
+            _ja3FingerprintingEnabled = _options.EnableJa3Fingerprinting &&
+                _options.FingerprintPreset != Ja3Preset.Disabled;
 
             _cookieManager = _options.CookieManager ?? new MojaveCookieManager();
             _options.CookieManager = _cookieManager;
@@ -387,7 +388,7 @@ namespace Moljave.Http
 
             lock (_fingerprintLock)
             {
-                _currentFingerprint = (_fingerprintFactory ?? DefaultFingerprintFactory)();
+                _currentFingerprint = (_fingerprintFactory ?? ResolvePresetFactory())();
             }
         }
 
@@ -724,7 +725,7 @@ namespace Moljave.Http
         {
             lock (_fingerprintLock)
             {
-                _fingerprintFactory = fingerprintProvider ?? DefaultFingerprintFactory;
+                _fingerprintFactory = fingerprintProvider ?? ResolvePresetFactory();
                 _currentFingerprint = null;
             }
         }
@@ -741,9 +742,17 @@ namespace Moljave.Http
         {
             lock (_fingerprintLock)
             {
-                _currentFingerprint ??= (_fingerprintFactory ?? DefaultFingerprintFactory)();
+                _currentFingerprint ??= (_fingerprintFactory ?? ResolvePresetFactory())();
                 return _currentFingerprint;
             }
+        }
+
+        private Func<JA3Fingerprint> ResolvePresetFactory()
+        {
+            return () => JA3FingerprintFactory.GetFingerprint(
+                _options.FingerprintPreset == Ja3Preset.Disabled
+                    ? Ja3Preset.Default
+                    : _options.FingerprintPreset);
         }
 
         private static MojaveHttpClientOptions BuildOptions(Action<MojaveHttpClientOptions> configure)
@@ -752,8 +761,5 @@ namespace Moljave.Http
             configure?.Invoke(options);
             return options;
         }
-
-        private static JA3Fingerprint DefaultFingerprintFactory()
-            => JA3FingerprintFactory.GetFingerprint(BrowserJa3Profile.Chrome);
     }
 }

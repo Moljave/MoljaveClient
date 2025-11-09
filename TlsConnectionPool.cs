@@ -71,6 +71,7 @@ namespace Moljave.Http
                 var client = new TlsClient(
                     host,
                     port,
+                    useTls,
                     fingerprint,
                     proxyDescriptor,
                     tlsSettings,

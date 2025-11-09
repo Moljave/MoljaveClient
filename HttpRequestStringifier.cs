@@ -9,7 +9,7 @@ namespace Moljave.Http
 {
     public static class HttpRequestStringifier
     {
-        public static async Task<byte[]> Stringify(HttpRequestMessage request)
+        public static async Task<byte[]> Stringify(HttpRequestMessage request, bool useAbsoluteUri = false)
         {
             if (request == null)
             {
@@ -17,15 +17,31 @@ namespace Moljave.Http
             }
 
             var uri = request.RequestUri ?? throw new InvalidOperationException("RequestUri cannot be null");
-            var target = uri.PathAndQuery;
-            if (string.IsNullOrEmpty(target))
-            {
-                target = "/";
-            }
+            string target;
 
-            if (!string.IsNullOrEmpty(uri.Fragment))
+            if (useAbsoluteUri)
             {
-                target += uri.Fragment;
+                var schemeAndServer = uri.GetComponents(UriComponents.SchemeAndServer, UriFormat.UriEscaped);
+                var pathAndQuery = uri.GetComponents(UriComponents.PathAndQuery, UriFormat.UriEscaped);
+                if (string.IsNullOrEmpty(pathAndQuery))
+                {
+                    pathAndQuery = "/";
+                }
+
+                target = string.Concat(schemeAndServer, pathAndQuery);
+            }
+            else
+            {
+                target = uri.PathAndQuery;
+                if (string.IsNullOrEmpty(target))
+                {
+                    target = "/";
+                }
+
+                if (!string.IsNullOrEmpty(uri.Fragment))
+                {
+                    target += uri.Fragment;
+                }
             }
 
             byte[] contentBytes = Array.Empty<byte>();

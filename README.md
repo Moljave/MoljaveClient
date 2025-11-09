@@ -110,6 +110,9 @@ options.DelegatingHandlerFactories.Add(() => new MyTelemetryHandler());
 
 using var client = new MojaveHttpClient(options);
 
+// choose a built-in JA3 preset (Disabled, Default, Chrome)
+options.FingerprintPreset = Ja3Preset.Chrome;
+
 // rotate to a fresh JA3 fingerprint whenever you need
 client.RotateFingerprint();
 
@@ -136,11 +139,15 @@ var response = await client.SendAsync(request);
 ### 🍪 Cookie management cheatsheet
 
 ```csharp
-// Update a cookie value on the fly
-client.CookieManager.SetCookie("example.com", "session", "new-value");
+// Update a cookie value wherever it exists
+client.CookieManager.ChangeCookieValue("session", "new-value");
 
-// Remove a specific cookie
+// Remove a cookie globally or for a specific domain
+client.CookieManager.RemoveCookie("session");
 client.CookieManager.RemoveCookie("example.com", "session");
+
+// Drop every cookie except the ones you want to keep
+client.CookieManager.RemoveCookies(new List<string> { "session", "auth_token" });
 
 // Clear cookies for a single domain or every domain
 client.ClearCookiesForDomain("example.com");
@@ -168,9 +175,9 @@ client.EnableProxy();
 ## 🧪 Custom JA3 Example
 
 ```csharp
-var ja3 = JA3FingerprintFactory.GetFingerprint(
-    BrowserJa3Profile.Custom,
-    "771,4866-4867-4865-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-45-43-51-27-21-41-28-19,29-23-24,0"
-);
+// Parse a custom JA3 fingerprint and pin it to the client
+var ja3 = JA3FingerprintParser.Parse(
+    "771,4866-4867-4865-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-45-43-51-27-21-41-28-19,29-23-24,0");
 
-
+client.UseFingerprintProvider(() => ja3);
+```
