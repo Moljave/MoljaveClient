@@ -41,6 +41,62 @@ using var client = new MojaveHttpClient();
 client.UseFingerprintProvider(() => customJa3, rotateImmediately: true);
 ```
 
+## Spoof a TLS handshake globally
+```csharp
+using System;
+using System.Security.Authentication;
+using System.Net.Security;
+
+var options = new MojaveHttpClientOptions
+{
+    EnableJa3Fingerprinting = true,
+    // Randomly rotates through built-in Chrome-like fingerprints.
+    FingerprintPreset = Ja3Preset.Chrome,
+    TlsSettingsProvider = () => new MojaveTlsSettings
+    {
+        EnabledProtocols = SslProtocols.Tls13 | SslProtocols.Tls12,
+        ApplicationProtocols = new[] { "h2", "http/1.1" },
+        // Keep certificate validation enabled when spoofing TLS fingerprints.
+        ValidateCertificate = true
+    }
+};
+
+using var client = new MojaveHttpClient(options);
+var response = await client.GetAsync("https://example.com");
+```
+
+## Override TLS and SSL options per request
+```csharp
+using System;
+using System.Security.Authentication;
+using System.Net.Security;
+
+var request = new HttpRequestMessage(HttpMethod.Get, "https://api.example.org/data");
+
+request.ConfigureMojaveOptions(o =>
+{
+    // Supply an explicit JA3 string that advertises a custom cipher suite order.
+    o.Fingerprint = JA3FingerprintParser.Parse(
+        "771,4866-4867-4865-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-10-11-35-13-18-45-51-27-21-41-65281,29-23-24,0");
+
+    o.TlsSettings = new MojaveTlsSettings
+    {
+        EnabledProtocols = SslProtocols.Tls12,
+        ApplicationProtocols = new[] { "http/1.1" },
+        ValidateCertificate = true,
+        CertificateValidationCallback = (sender, certificate, chain, errors) =>
+        {
+            // Pin the certificate issuer while keeping validation enabled.
+            return errors == SslPolicyErrors.None &&
+                   certificate?.Issuer?.Contains("Example CA", StringComparison.OrdinalIgnoreCase) == true;
+        }
+    };
+});
+
+using var client = new MojaveHttpClient();
+var spoofedResponse = await client.SendAsync(request);
+```
+
 ## Rotate proxies while keeping cookies
 ```csharp
 var proxies = new Queue<string>(new[]
