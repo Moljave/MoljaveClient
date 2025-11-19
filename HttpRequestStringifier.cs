@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
@@ -70,7 +71,7 @@ namespace Moljave.Http
                 builder.Append(header.Key);
                 builder.Append(':');
                 builder.Append(' ');
-                builder.Append(string.Join(", ", header.Value));
+                builder.Append(FormatHeaderValue(header.Key, header.Value));
                 builder.Append("\r\n");
             }
 
@@ -81,7 +82,7 @@ namespace Moljave.Http
                     builder.Append(header.Key);
                     builder.Append(':');
                     builder.Append(' ');
-                    builder.Append(string.Join(", ", header.Value));
+                    builder.Append(FormatHeaderValue(header.Key, header.Value));
                     builder.Append("\r\n");
                 }
             }
@@ -157,6 +158,12 @@ namespace Moljave.Http
 
             var value = versionPolicyProperty.GetValue(source);
             versionPolicyProperty.SetValue(destination, value);
+        }
+
+        private static string FormatHeaderValue(string headerName, IEnumerable<string> values)
+        {
+            var separator = headerName.Equals("User-Agent", StringComparison.OrdinalIgnoreCase) ? " " : ",";
+            return string.Join(separator, values);
         }
     }
 }
