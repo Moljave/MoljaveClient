@@ -1,5 +1,4 @@
 using System;
-using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
 
@@ -27,41 +26,6 @@ namespace Moljave.Http
 
             clone.Headers.ContentLength = data.Length;
             return clone;
-        }
-
-        public static void AddHeaders(this HttpRequestMessage request, string headers)
-        {
-            if (request == null)
-            {
-                throw new ArgumentNullException(nameof(request));
-            }
-
-            if (string.IsNullOrWhiteSpace(headers))
-            {
-                return;
-            }
-
-            var lines = headers
-                .Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(line => line.Trim())
-                .Where(line => !string.IsNullOrWhiteSpace(line));
-
-            foreach (var line in lines)
-            {
-                var separatorIndex = line.IndexOf(':');
-                if (separatorIndex <= 0 || separatorIndex == line.Length - 1)
-                {
-                    continue;
-                }
-
-                var key = line[..separatorIndex].Trim();
-                var value = line[(separatorIndex + 1)..].Trim();
-
-                if (!request.Headers.TryAddWithoutValidation(key, value))
-                {
-                    request.Content?.Headers.TryAddWithoutValidation(key, value);
-                }
-            }
         }
 
         public static MojaveRequestOptions GetMojaveOptions(this HttpRequestMessage request)

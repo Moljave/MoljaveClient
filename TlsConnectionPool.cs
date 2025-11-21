@@ -231,10 +231,9 @@ namespace Moljave.Http
                 effectivePort = proxyDescriptor.Port;
                 effectiveTls = proxyDescriptor.Scheme == ProxyScheme.Https;
 
-                // When going through a proxy, throttle by the proxy endpoint itself
-                // so multiple affinities sharing the same rotating proxy port do not
-                // overrun the ephemeral port range. Affinity stays effective for
-                // direct connections.
+                // When going through a proxy, throttle by the proxy endpoint itself and
+                // reuse gates across callers so many affinities sharing a rotating proxy
+                // port do not overrun the ephemeral port range.
                 affinityHash = 0;
             }
 
@@ -254,6 +253,13 @@ namespace Moljave.Http
             var affinityHash = affinityKey == null
                 ? 0
                 : RuntimeHelpers.GetHashCode(affinityKey);
+
+            if (proxyDescriptor != null)
+            {
+                // Reuse connections across callers when tunneling through a proxy endpoint to
+                // avoid unnecessary socket churn and resulting port exhaustion.
+                affinityHash = 0;
+            }
 
             return new PoolKey(
                 host,
@@ -513,7 +519,7 @@ namespace Moljave.Http
                 if (maxConnections > _maxConnections)
                 {
                     var inUse = (_maxConnections - _semaphore.CurrentCount) + _reservedPermits;
-                    var available = Math.Max(0, maxConnections - inUse);
+                    var available = Math.Clamp(maxConnections - inUse, 0, maxConnections);
 
                     _semaphore = new SemaphoreSlim(available, maxConnections);
                     _reservedPermits = 0;
