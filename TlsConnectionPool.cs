@@ -151,14 +151,16 @@ namespace Moljave.Http
             }
         }
 
-        public void ClearAffinity(object affinityKey)
+        public void ClearAffinity(object affinityKey, bool includeNullAffinity = false)
         {
-            if (affinityKey == null)
+            if (affinityKey == null && !includeNullAffinity)
             {
                 return;
             }
 
-            var affinityHash = RuntimeHelpers.GetHashCode(affinityKey);
+            var affinityHash = affinityKey == null
+                ? 0
+                : RuntimeHelpers.GetHashCode(affinityKey);
             var keysToClear = new List<PoolKey>();
 
             foreach (var kvp in _states)
