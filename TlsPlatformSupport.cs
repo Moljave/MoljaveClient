@@ -25,16 +25,6 @@ namespace Moljave.Http
 
         private static bool DetermineCipherSuitesPolicySupport()
         {
-            if (!OperatingSystem.IsWindows())
-            {
-                return false;
-            }
-
-            if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
-            {
-                return false;
-            }
-
             try
             {
                 _ = new System.Net.Security.CipherSuitesPolicy(Array.Empty<System.Net.Security.TlsCipherSuite>());
