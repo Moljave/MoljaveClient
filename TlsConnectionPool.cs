@@ -52,7 +52,7 @@ namespace Moljave.Http
                 affinityKey,
                 socketBufferSize);
 
-            var gateKey = CreateConnectionGateKey(host, port, useTls, proxyDescriptor);
+            var gateKey = CreateConnectionGateKey(host, port, useTls, proxyDescriptor, affinityKey);
 
             var state = _states.GetOrAdd(poolKey, _ => new PoolState());
             var gate = _connectionGates.GetOrAdd(gateKey, _ => new ConnectionGate(maxConnections));
@@ -203,7 +203,7 @@ namespace Moljave.Http
                 return;
             }
 
-            var gateKey = CreateConnectionGateKey(host, port, useTls, proxyDescriptor);
+            var gateKey = CreateConnectionGateKey(host, port, useTls, proxyDescriptor, affinityKey);
             if (_connectionGates.TryGetValue(gateKey, out var gate))
             {
                 gate.AdjustMaxConnections(maxConnections);
@@ -214,12 +214,16 @@ namespace Moljave.Http
             string host,
             int port,
             bool useTls,
-            ProxyDescriptor proxyDescriptor)
+            ProxyDescriptor proxyDescriptor,
+            object affinityKey)
         {
             var effectiveHost = host;
             var effectivePort = port;
             var effectiveTls = useTls;
             var proxyIdentity = BuildProxyIdentity(proxyDescriptor);
+            var affinityHash = affinityKey == null
+                ? 0
+                : RuntimeHelpers.GetHashCode(affinityKey);
 
             if (proxyDescriptor != null)
             {
@@ -228,7 +232,7 @@ namespace Moljave.Http
                 effectiveTls = proxyDescriptor.Scheme == ProxyScheme.Https;
             }
 
-            return new ConnectionGateKey(effectiveHost, effectivePort, effectiveTls, proxyIdentity);
+            return new ConnectionGateKey(effectiveHost, effectivePort, effectiveTls, proxyIdentity, affinityHash);
         }
 
         private static PoolKey CreatePoolKey(
@@ -411,25 +415,28 @@ namespace Moljave.Http
 
         internal readonly struct ConnectionGateKey : IEquatable<ConnectionGateKey>
         {
-            public ConnectionGateKey(string host, int port, bool useTls, string proxyIdentity)
+            public ConnectionGateKey(string host, int port, bool useTls, string proxyIdentity, int affinityHash)
             {
                 Host = host;
                 Port = port;
                 UseTls = useTls;
                 ProxyIdentity = proxyIdentity ?? string.Empty;
+                AffinityHash = affinityHash;
             }
 
             public string Host { get; }
             public int Port { get; }
             public bool UseTls { get; }
             public string ProxyIdentity { get; }
+            public int AffinityHash { get; }
 
             public bool Equals(ConnectionGateKey other)
             {
                 return Port == other.Port &&
                     UseTls == other.UseTls &&
                     string.Equals(Host, other.Host, StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(ProxyIdentity, other.ProxyIdentity, StringComparison.Ordinal);
+                    string.Equals(ProxyIdentity, other.ProxyIdentity, StringComparison.Ordinal) &&
+                    AffinityHash == other.AffinityHash;
             }
 
             public override bool Equals(object obj)
@@ -444,6 +451,7 @@ namespace Moljave.Http
                 hash.Add(Port);
                 hash.Add(UseTls);
                 hash.Add(ProxyIdentity, StringComparer.Ordinal);
+                hash.Add(AffinityHash);
                 return hash.ToHashCode();
             }
         }
