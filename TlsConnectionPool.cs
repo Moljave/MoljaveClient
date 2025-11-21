@@ -151,6 +151,37 @@ namespace Moljave.Http
             }
         }
 
+        public void ClearAffinity(object affinityKey)
+        {
+            if (affinityKey == null)
+            {
+                return;
+            }
+
+            var affinityHash = RuntimeHelpers.GetHashCode(affinityKey);
+            var keysToClear = new List<PoolKey>();
+
+            foreach (var kvp in _states)
+            {
+                if (kvp.Key.AffinityHash == affinityHash)
+                {
+                    keysToClear.Add(kvp.Key);
+                }
+            }
+
+            foreach (var key in keysToClear)
+            {
+                if (_states.TryRemove(key, out var state))
+                {
+                    state.ClearQueue();
+                }
+                else if (_states.TryGetValue(key, out var existing))
+                {
+                    existing.ClearQueue();
+                }
+            }
+        }
+
         public void AdjustMaxConnections(
             string host,
             int port,
@@ -401,19 +432,13 @@ namespace Moljave.Http
 
                 if (maxConnections > _maxConnections)
                 {
-                    var difference = maxConnections - _maxConnections;
+                    var inUse = (_maxConnections - _semaphore.CurrentCount) + _reservedPermits;
+                    var available = Math.Max(0, maxConnections - inUse);
 
-                    if (_reservedPermits > 0)
-                    {
-                        var restore = Math.Min(_reservedPermits, difference);
-                        _reservedPermits -= restore;
-                        difference -= restore;
-                    }
-
-                    if (difference > 0)
-                    {
-                        _semaphore.Release(difference);
-                    }
+                    _semaphore = new SemaphoreSlim(available, maxConnections);
+                    _reservedPermits = 0;
+                    _maxConnections = maxConnections;
+                    return;
                 }
                 else
                 {

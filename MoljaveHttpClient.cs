@@ -544,6 +544,7 @@ namespace Moljave.Http
             }
 
             _disposed = true;
+            TlsConnectionPool.Shared.ClearAffinity(_options?.CookieManager);
             _invoker.Dispose();
             _defaultRequest.Dispose();
         }

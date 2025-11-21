@@ -18,7 +18,7 @@ namespace Moljave.Http
         private int _maxAutomaticRedirections = 10;
         private int _maxConnectionRetries = 2;
         private long _connectionRetryDelayTicks = TimeSpan.FromMilliseconds(150).Ticks;
-        private int _maxConnectionsPerHost = 256;
+        private int _maxConnectionsPerHost = 8;
         private int _socketBufferSize = 8 * 1024;
         private int _forceConnectionCloseAfterRequest = 0;
 
