@@ -219,6 +219,7 @@ namespace Moljave.Http
             var effectiveHost = host;
             var effectivePort = port;
             var effectiveTls = useTls;
+            var proxyIdentity = BuildProxyIdentity(proxyDescriptor);
 
             if (proxyDescriptor != null)
             {
@@ -227,7 +228,7 @@ namespace Moljave.Http
                 effectiveTls = proxyDescriptor.Scheme == ProxyScheme.Https;
             }
 
-            return new ConnectionGateKey(effectiveHost, effectivePort, effectiveTls);
+            return new ConnectionGateKey(effectiveHost, effectivePort, effectiveTls, proxyIdentity);
         }
 
         private static PoolKey CreatePoolKey(
@@ -314,18 +315,42 @@ namespace Moljave.Http
                 return "no-proxy";
             }
 
-            var credential = descriptor.Credentials;
+            return BuildProxySignature(descriptor.Credentials, descriptor.Scheme, descriptor.Host, descriptor.Port, descriptor.ResolveHostnamesRemotely);
+        }
+
+        private static string BuildProxyIdentity(ProxyDescriptor descriptor)
+        {
+            if (descriptor == null)
+            {
+                return "no-proxy";
+            }
+
+            return BuildProxySignature(
+                descriptor.Credentials,
+                descriptor.Scheme,
+                descriptor.Host,
+                descriptor.Port,
+                descriptor.ResolveHostnamesRemotely);
+        }
+
+        private static string BuildProxySignature(
+            NetworkCredential credential,
+            ProxyScheme scheme,
+            string host,
+            int port,
+            bool resolveRemotely)
+        {
             var username = credential?.UserName ?? string.Empty;
             var password = credential?.Password ?? string.Empty;
 
             return string.Join('|', new[]
             {
-                descriptor.Scheme.ToString(),
-                descriptor.Host,
-                descriptor.Port.ToString(),
+                scheme.ToString(),
+                host,
+                port.ToString(),
                 username,
                 password,
-                descriptor.ResolveHostnamesRemotely.ToString()
+                resolveRemotely.ToString()
             });
         }
 
@@ -386,22 +411,25 @@ namespace Moljave.Http
 
         internal readonly struct ConnectionGateKey : IEquatable<ConnectionGateKey>
         {
-            public ConnectionGateKey(string host, int port, bool useTls)
+            public ConnectionGateKey(string host, int port, bool useTls, string proxyIdentity)
             {
                 Host = host;
                 Port = port;
                 UseTls = useTls;
+                ProxyIdentity = proxyIdentity ?? string.Empty;
             }
 
             public string Host { get; }
             public int Port { get; }
             public bool UseTls { get; }
+            public string ProxyIdentity { get; }
 
             public bool Equals(ConnectionGateKey other)
             {
                 return Port == other.Port &&
                     UseTls == other.UseTls &&
-                    string.Equals(Host, other.Host, StringComparison.OrdinalIgnoreCase);
+                    string.Equals(Host, other.Host, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(ProxyIdentity, other.ProxyIdentity, StringComparison.Ordinal);
             }
 
             public override bool Equals(object obj)
@@ -415,6 +443,7 @@ namespace Moljave.Http
                 hash.Add(Host, StringComparer.OrdinalIgnoreCase);
                 hash.Add(Port);
                 hash.Add(UseTls);
+                hash.Add(ProxyIdentity, StringComparer.Ordinal);
                 return hash.ToHashCode();
             }
         }
