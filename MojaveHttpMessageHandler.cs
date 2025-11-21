@@ -572,7 +572,7 @@ namespace Moljave.Http
                             var connector = new TlsClient(
                                 context.DnsEndPoint.Host,
                                 context.DnsEndPoint.Port,
-                                useTls: true,
+                                targetUsesTls: true,
                                 fingerprint,
                                 proxyOptions.Descriptor,
                                 tlsSettings,

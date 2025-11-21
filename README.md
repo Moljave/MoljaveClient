@@ -76,11 +76,11 @@ class Program
         client.SetProxy(new WebProxy("socks5://127.0.0.1:9050"));
 
         var request = new HttpRequestMessage(HttpMethod.Get, "https://example.com/");
-        request.AddHeaders(@"
-            User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
-            Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8
-            Accept-Language: en-US,en;q=0.9
-        ");
+        request.Headers.TryAddWithoutValidation(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        request.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8");
+        request.Headers.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
 
         var response = await client.SendAsync(request, TimeSpan.FromSeconds(10));
         var html = await response.Content.ReadAsStringAsync();
