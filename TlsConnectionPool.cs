@@ -14,6 +14,7 @@ namespace Moljave.Http
         private static readonly Lazy<TlsConnectionPool> _lazy = new(() => new TlsConnectionPool());
 
         private readonly ConcurrentDictionary<PoolKey, PoolState> _states = new();
+        private readonly ConcurrentDictionary<ConnectionGateKey, ConnectionGate> _connectionGates = new();
 
         public static TlsConnectionPool Shared => _lazy.Value;
 
@@ -41,7 +42,7 @@ namespace Moljave.Http
 
             maxConnections = Math.Max(1, maxConnections);
 
-            var key = CreatePoolKey(
+            var poolKey = CreatePoolKey(
                 host,
                 port,
                 useTls,
@@ -51,10 +52,12 @@ namespace Moljave.Http
                 affinityKey,
                 socketBufferSize);
 
-            var state = _states.GetOrAdd(key, _ => new PoolState());
-            var semaphore = state.GetSemaphore(maxConnections);
+            var gateKey = CreateConnectionGateKey(host, port, useTls, proxyDescriptor);
 
-            await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var state = _states.GetOrAdd(poolKey, _ => new PoolState());
+            var gate = _connectionGates.GetOrAdd(gateKey, _ => new ConnectionGate(maxConnections));
+
+            await gate.WaitAsync(maxConnections, cancellationToken).ConfigureAwait(false);
 
             try
             {
@@ -62,7 +65,7 @@ namespace Moljave.Http
                 {
                     if (existing != null && existing.IsReusable)
                     {
-                        return new TlsClientLease(this, state, existing);
+                        return new TlsClientLease(this, state, gate, existing);
                     }
 
                     existing?.Dispose();
@@ -78,11 +81,11 @@ namespace Moljave.Http
                     certificateValidationCallback,
                     socketBufferSize);
 
-                return new TlsClientLease(this, state, client);
+                return new TlsClientLease(this, state, gate, client);
             }
             catch
             {
-                state.ReleaseLease();
+                gate.ReleaseLease();
                 throw;
             }
         }
@@ -200,20 +203,31 @@ namespace Moljave.Http
                 return;
             }
 
-            var key = CreatePoolKey(
-                host,
-                port,
-                useTls,
-                fingerprint,
-                tlsSettings,
-                proxyDescriptor,
-                affinityKey,
-                socketBufferSize);
-
-            if (_states.TryGetValue(key, out var state))
+            var gateKey = CreateConnectionGateKey(host, port, useTls, proxyDescriptor);
+            if (_connectionGates.TryGetValue(gateKey, out var gate))
             {
-                state.AdjustMaxConnections(maxConnections);
+                gate.AdjustMaxConnections(maxConnections);
             }
+        }
+
+        private static ConnectionGateKey CreateConnectionGateKey(
+            string host,
+            int port,
+            bool useTls,
+            ProxyDescriptor proxyDescriptor)
+        {
+            var effectiveHost = host;
+            var effectivePort = port;
+            var effectiveTls = useTls;
+
+            if (proxyDescriptor != null)
+            {
+                effectiveHost = proxyDescriptor.Host;
+                effectivePort = proxyDescriptor.Port;
+                effectiveTls = proxyDescriptor.Scheme == ProxyScheme.Https;
+            }
+
+            return new ConnectionGateKey(effectiveHost, effectivePort, effectiveTls);
         }
 
         private static PoolKey CreatePoolKey(
@@ -243,6 +257,7 @@ namespace Moljave.Http
 
         internal void Return(
             PoolState state,
+            ConnectionGate gate,
             TlsClient client,
             bool canReuse)
         {
@@ -252,7 +267,7 @@ namespace Moljave.Http
             }
             finally
             {
-                state.ReleaseLease();
+                gate.ReleaseLease();
             }
         }
 
@@ -369,64 +384,84 @@ namespace Moljave.Http
             }
         }
 
-        internal sealed class PoolState
+        internal readonly struct ConnectionGateKey : IEquatable<ConnectionGateKey>
         {
-            private readonly ConcurrentQueue<TlsClient> _queue = new();
+            public ConnectionGateKey(string host, int port, bool useTls)
+            {
+                Host = host;
+                Port = port;
+                UseTls = useTls;
+            }
+
+            public string Host { get; }
+            public int Port { get; }
+            public bool UseTls { get; }
+
+            public bool Equals(ConnectionGateKey other)
+            {
+                return Port == other.Port &&
+                    UseTls == other.UseTls &&
+                    string.Equals(Host, other.Host, StringComparison.OrdinalIgnoreCase);
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is ConnectionGateKey other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                var hash = new HashCode();
+                hash.Add(Host, StringComparer.OrdinalIgnoreCase);
+                hash.Add(Port);
+                hash.Add(UseTls);
+                return hash.ToHashCode();
+            }
+        }
+
+        internal sealed class ConnectionGate
+        {
             private SemaphoreSlim _semaphore;
             private int _maxConnections;
             private int _reservedPermits;
 
-            public ConcurrentQueue<TlsClient> Queue => _queue;
+            public ConnectionGate(int maxConnections)
+            {
+                maxConnections = Math.Max(1, maxConnections);
+                _semaphore = new SemaphoreSlim(maxConnections, maxConnections);
+                _maxConnections = maxConnections;
+                _reservedPermits = 0;
+            }
 
-            public SemaphoreSlim GetSemaphore(int maxConnections)
+            public async Task WaitAsync(int maxConnections, CancellationToken cancellationToken)
+            {
+                var semaphore = GetSemaphore(maxConnections);
+                await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            public void AdjustMaxConnections(int maxConnections)
             {
                 maxConnections = Math.Max(1, maxConnections);
 
                 lock (this)
                 {
-                    if (_semaphore == null)
-                    {
-                        _semaphore = new SemaphoreSlim(maxConnections, maxConnections);
-                        _maxConnections = maxConnections;
-                        _reservedPermits = 0;
-                        return _semaphore;
-                    }
+                    AdjustMaxConnectionsLocked(maxConnections);
+                }
+            }
 
+            private SemaphoreSlim GetSemaphore(int maxConnections)
+            {
+                maxConnections = Math.Max(1, maxConnections);
+
+                lock (this)
+                {
                     AdjustMaxConnectionsLocked(maxConnections);
                     return _semaphore;
                 }
             }
 
-            public void ClearQueue()
-            {
-                while (_queue.TryDequeue(out var client))
-                {
-                    client?.Dispose();
-                }
-            }
-
-            public void AdjustMaxConnections(int maxConnections)
-            {
-                if (_semaphore == null)
-                {
-                    return;
-                }
-
-                maxConnections = Math.Max(1, maxConnections);
-
-                lock (this)
-                {
-                    AdjustMaxConnectionsLocked(maxConnections);
-                }
-            }
-
             private void AdjustMaxConnectionsLocked(int maxConnections)
             {
-                if (_semaphore == null)
-                {
-                    return;
-                }
-
                 if (maxConnections == _maxConnections)
                 {
                     return;
@@ -442,38 +477,24 @@ namespace Moljave.Http
                     _maxConnections = maxConnections;
                     return;
                 }
-                else
-                {
-                    var difference = _maxConnections - maxConnections;
-                    var drained = 0;
-                    for (; drained < difference; drained++)
-                    {
-                        if (!_semaphore.Wait(0))
-                        {
-                            break;
-                        }
-                    }
 
-                    var remaining = difference - drained;
-                    if (remaining > 0)
+                var difference = _maxConnections - maxConnections;
+                var drained = 0;
+                for (; drained < difference; drained++)
+                {
+                    if (!_semaphore.Wait(0))
                     {
-                        _reservedPermits += remaining;
+                        break;
                     }
+                }
+
+                var remaining = difference - drained;
+                if (remaining > 0)
+                {
+                    _reservedPermits += remaining;
                 }
 
                 _maxConnections = maxConnections;
-            }
-
-            public void ReturnClient(TlsClient client, bool canReuse)
-            {
-                if (canReuse && client != null && client.IsReusable)
-                {
-                    _queue.Enqueue(client);
-                }
-                else
-                {
-                    client?.Dispose();
-                }
             }
 
             public void ReleaseLease()
@@ -496,22 +517,53 @@ namespace Moljave.Http
                 semaphore.Release();
             }
         }
+
+        internal sealed class PoolState
+        {
+            private readonly ConcurrentQueue<TlsClient> _queue = new();
+
+            public ConcurrentQueue<TlsClient> Queue => _queue;
+
+            public void ClearQueue()
+            {
+                while (_queue.TryDequeue(out var client))
+                {
+                    client?.Dispose();
+                }
+            }
+
+            public void ReturnClient(TlsClient client, bool canReuse)
+            {
+                if (canReuse && client != null && client.IsReusable)
+                {
+                    _queue.Enqueue(client);
+                }
+                else
+                {
+                    client?.Dispose();
+                }
+            }
+
+        }
     }
 
     internal sealed class TlsClientLease : IDisposable
     {
         private readonly TlsConnectionPool _pool;
         private readonly TlsConnectionPool.PoolState _state;
+        private readonly ConnectionGate _gate;
         private bool _disposed;
         private bool _canReuse;
 
         public TlsClientLease(
             TlsConnectionPool pool,
             TlsConnectionPool.PoolState state,
+            ConnectionGate gate,
             TlsClient client)
         {
             _pool = pool ?? throw new ArgumentNullException(nameof(pool));
             _state = state ?? throw new ArgumentNullException(nameof(state));
+            _gate = gate ?? throw new ArgumentNullException(nameof(gate));
             Client = client ?? throw new ArgumentNullException(nameof(client));
             _canReuse = false;
         }
@@ -536,7 +588,7 @@ namespace Moljave.Http
             }
 
             _disposed = true;
-            _pool.Return(_state, Client, _canReuse);
+            _pool.Return(_state, _gate, Client, _canReuse);
         }
     }
 }
