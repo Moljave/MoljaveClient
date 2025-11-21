@@ -230,6 +230,12 @@ namespace Moljave.Http
                 effectiveHost = proxyDescriptor.Host;
                 effectivePort = proxyDescriptor.Port;
                 effectiveTls = proxyDescriptor.Scheme == ProxyScheme.Https;
+
+                // When going through a proxy, throttle by the proxy endpoint itself
+                // so multiple affinities sharing the same rotating proxy port do not
+                // overrun the ephemeral port range. Affinity stays effective for
+                // direct connections.
+                affinityHash = 0;
             }
 
             return new ConnectionGateKey(effectiveHost, effectivePort, effectiveTls, proxyIdentity, affinityHash);
