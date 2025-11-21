@@ -551,14 +551,14 @@ namespace Moljave.Http
     {
         private readonly TlsConnectionPool _pool;
         private readonly TlsConnectionPool.PoolState _state;
-        private readonly ConnectionGate _gate;
+        private readonly TlsConnectionPool.ConnectionGate _gate;
         private bool _disposed;
         private bool _canReuse;
 
         public TlsClientLease(
             TlsConnectionPool pool,
             TlsConnectionPool.PoolState state,
-            ConnectionGate gate,
+            TlsConnectionPool.ConnectionGate gate,
             TlsClient client)
         {
             _pool = pool ?? throw new ArgumentNullException(nameof(pool));
